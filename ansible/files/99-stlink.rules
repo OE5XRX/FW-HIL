@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# udev rules for STMicroelectronics ST-Link debug probes.
+#
+# Grants access to the plugdev group so the bench runner user can use pyocd/openocd
+# without root, and creates a stable /dev/stlink-hil symlink.
+#
+# For a multi-probe bench: add ATTRS{serial}=="<serial>" to each rule and create
+# distinct SYMLINK names (e.g. stlink-hil-0, stlink-hil-1).  The probe serial is
+# obtained from `pyocd list --uid` and stored in /etc/fw-hil/hardware-map.yaml.
+
+# ST-LINK/V2
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="374b", GROUP="plugdev", MODE="0664", SYMLINK+="stlink-hil"
+
+# ST-LINK/V3E  (most common for STM32U5 + Nucleo boards)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="374e", GROUP="plugdev", MODE="0664", SYMLINK+="stlink-hil"
+
+# ST-LINK/V3S
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="374f", GROUP="plugdev", MODE="0664", SYMLINK+="stlink-hil"
+
+# ST-LINK/V3PWR
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="380e", GROUP="plugdev", MODE="0664", SYMLINK+="stlink-hil"

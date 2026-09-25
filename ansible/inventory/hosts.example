@@ -1,0 +1,4 @@
+# FW-HIL bench inventory — copy and adapt for your bench host.
+# For CI syntax-checking this file is used as-is (no connection made).
+[bench]
+hil-bench ansible_host=192.168.1.100 ansible_user=ubuntu
