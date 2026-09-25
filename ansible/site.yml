@@ -1,0 +1,275 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# FW-HIL Bench Provisioning Playbook
+# Target: fresh Ubuntu Server 24.04 LTS host
+#
+# ── Dry-run (syntax check, no host connection) ────────────────────────────────
+#   cd ansible/
+#   ansible-playbook --syntax-check -i inventory/hosts.example site.yml
+#
+# ── Check mode (connect, make no changes) ────────────────────────────────────
+#   ansible-playbook --check -i inventory/hosts.example site.yml \
+#     --extra-vars "gh_runner_token=CHANGEME"
+#
+# ── Full apply ────────────────────────────────────────────────────────────────
+#   Obtain a registration token from:
+#     https://github.com/organizations/OE5XRX/settings/actions/runners/new
+#   Then:
+#   ansible-playbook -i inventory/hosts.example site.yml \
+#     --extra-vars "gh_runner_token=<token>"
+#
+#   Re-running the playbook on an already-provisioned host is always safe:
+#   every task is idempotent.
+#
+# ── After apply ──────────────────────────────────────────────────────────────
+#   1. Run `pyocd list --uid` on the bench to find the ST-Link probe serial.
+#   2. Run `lsusb -v -d 2fe3:0100 | grep iSerial` for the board serial.
+#   3. Edit /etc/fw-hil/hardware-map.yaml (deployed by this playbook) to fill
+#      in both CHANGEME placeholders, then re-run the playbook.
+---
+- name: Provision FW-HIL bench host
+  hosts: bench
+  become: true
+
+  vars:
+    bench_user: runner
+    venv_path: /opt/fw-hil-venv
+    zephyr_sdk_version: "0.17.0"
+    zephyr_sdk_dir: "/opt/zephyr-sdk-{{ zephyr_sdk_version }}"
+    fw_hil_repo_url: "https://github.com/OE5XRX/FW-HIL.git"
+    fw_hil_dir: /opt/fw-hil
+    gh_runner_version: "2.319.0"
+    gh_runner_dir: /opt/actions-runner
+    gh_runner_org_url: "https://github.com/OE5XRX"
+    gh_runner_labels: "self-hosted,hil,fm_board"
+    # gh_runner_token: NEVER hardcode — pass via --extra-vars or ansible-vault
+    hw_map_dest: /etc/fw-hil
+
+  tasks:
+    # ── base system packages ──────────────────────────────────────────────────
+    - name: Update apt package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install build and bench dependencies
+      ansible.builtin.apt:
+        name:
+          - alsa-utils
+          - ccache
+          - cmake
+          - curl
+          - device-tree-compiler
+          - dfu-util
+          - file
+          - g++-multilib
+          - gcc
+          - gcc-multilib
+          - gperf
+          - git
+          - libmagic1
+          - libsdl2-dev
+          - libusb-1.0-0-dev
+          - make
+          - ninja-build
+          - openocd
+          - python3
+          - python3-dev
+          - python3-pip
+          - python3-setuptools
+          - python3-venv
+          - python3-wheel
+          - usbutils
+          - wget
+          - xz-utils
+        state: present
+
+    # ── dedicated bench user ──────────────────────────────────────────────────
+    - name: Create bench runner user
+      ansible.builtin.user:
+        name: "{{ bench_user }}"
+        system: true
+        shell: /bin/bash
+        home: "/home/{{ bench_user }}"
+        create_home: true
+        state: present
+
+    - name: Add runner user to USB and serial access groups
+      ansible.builtin.user:
+        name: "{{ bench_user }}"
+        groups:
+          - plugdev
+          - dialout
+        append: true
+
+    # ── Python virtual environment ────────────────────────────────────────────
+    - name: Create Python venv for HIL tools
+      ansible.builtin.command:
+        cmd: "python3 -m venv {{ venv_path }}"
+        creates: "{{ venv_path }}/bin/activate"
+      changed_when: true  # only executes when creates target is absent
+
+    - name: Install HIL Python tools in venv
+      ansible.builtin.pip:
+        name:
+          - west
+          - pyocd
+        state: present
+        virtualenv: "{{ venv_path }}"
+
+    # ── Zephyr SDK ────────────────────────────────────────────────────────────
+    - name: Download Zephyr SDK minimal archive
+      ansible.builtin.get_url:
+        url: "https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v{{ zephyr_sdk_version }}/zephyr-sdk-{{ zephyr_sdk_version }}_linux-x86_64_minimal.tar.xz"
+        dest: "/tmp/zephyr-sdk-{{ zephyr_sdk_version }}.tar.xz"
+        mode: "0644"
+
+    - name: Extract Zephyr SDK
+      ansible.builtin.unarchive:
+        src: "/tmp/zephyr-sdk-{{ zephyr_sdk_version }}.tar.xz"
+        dest: /opt
+        remote_src: true
+        creates: "{{ zephyr_sdk_dir }}/sdk_version"
+
+    - name: Run Zephyr SDK setup for ARM toolchain
+      ansible.builtin.command:
+        cmd: "{{ zephyr_sdk_dir }}/setup.sh -t arm-zephyr-eabi -h"
+        creates: "{{ zephyr_sdk_dir }}/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc"
+      changed_when: true  # only executes when creates target is absent
+
+    # ── Clone and install fw_hil ──────────────────────────────────────────────
+    - name: Clone FW-HIL repository
+      ansible.builtin.git:
+        repo: "{{ fw_hil_repo_url }}"
+        dest: "{{ fw_hil_dir }}"
+        version: main  # noqa: latest[git]
+        update: true
+
+    - name: Install fw_hil package in editable mode
+      ansible.builtin.pip:
+        name: "{{ fw_hil_dir }}"
+        extra_args: "--editable"
+        state: present
+        virtualenv: "{{ venv_path }}"
+
+    # ── udev rules ────────────────────────────────────────────────────────────
+    - name: Install ST-Link udev rules
+      ansible.builtin.copy:
+        src: 99-stlink.rules
+        dest: /etc/udev/rules.d/99-stlink.rules
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Udev reload
+
+    - name: Install FM-Board udev rules
+      ansible.builtin.copy:
+        src: 99-fw-hil-board.rules
+        dest: /etc/udev/rules.d/99-fw-hil-board.rules
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Udev reload
+
+    # ── hardware-map.yaml ─────────────────────────────────────────────────────
+    - name: Create /etc/fw-hil configuration directory
+      ansible.builtin.file:
+        path: "{{ hw_map_dest }}"
+        state: directory
+        owner: "{{ bench_user }}"
+        group: "{{ bench_user }}"
+        mode: "0755"
+
+    - name: Deploy hardware-map template (preserved if already customized)
+      ansible.builtin.copy:
+        src: ../hardware-map.yaml
+        dest: "{{ hw_map_dest }}/hardware-map.yaml"
+        owner: "{{ bench_user }}"
+        group: "{{ bench_user }}"
+        mode: "0644"
+        force: false
+
+    # ── GitHub Actions self-hosted runner ─────────────────────────────────────
+    - name: Create runner directory
+      ansible.builtin.file:
+        path: "{{ gh_runner_dir }}"
+        state: directory
+        owner: "{{ bench_user }}"
+        group: "{{ bench_user }}"
+        mode: "0755"
+
+    - name: Download GitHub Actions runner archive
+      ansible.builtin.get_url:
+        url: "https://github.com/actions/runner/releases/download/v{{ gh_runner_version }}/actions-runner-linux-x64-{{ gh_runner_version }}.tar.gz"
+        dest: "/tmp/actions-runner-{{ gh_runner_version }}.tar.gz"
+        mode: "0644"
+
+    - name: Extract GitHub Actions runner
+      ansible.builtin.unarchive:
+        src: "/tmp/actions-runner-{{ gh_runner_version }}.tar.gz"
+        dest: "{{ gh_runner_dir }}"
+        remote_src: true
+        creates: "{{ gh_runner_dir }}/run.sh"
+
+    - name: Set runner directory ownership
+      ansible.builtin.file:
+        path: "{{ gh_runner_dir }}"
+        owner: "{{ bench_user }}"
+        group: "{{ bench_user }}"
+        recurse: true
+
+    - name: Check if runner is already configured
+      ansible.builtin.stat:
+        path: "{{ gh_runner_dir }}/.runner"
+      register: runner_configured
+
+    - name: Configure GitHub Actions runner
+      ansible.builtin.command:
+        cmd: >-
+          ./config.sh
+          --unattended
+          --url "{{ gh_runner_org_url }}"
+          --token "{{ gh_runner_token }}"
+          --name "{{ ansible_hostname }}"
+          --labels "{{ gh_runner_labels }}"
+          --runnergroup "Default"
+        chdir: "{{ gh_runner_dir }}"
+      become: true
+      become_user: "{{ bench_user }}"
+      when: not runner_configured.stat.exists
+      changed_when: not runner_configured.stat.exists
+      no_log: true
+
+    - name: Deploy runner systemd service unit
+      ansible.builtin.template:
+        src: gh-runner.service.j2
+        dest: /etc/systemd/system/gh-actions-runner.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Systemd daemon reload
+        - Enable and start runner service
+
+  handlers:
+    - name: Reload udev rules
+      ansible.builtin.command:
+        cmd: udevadm control --reload-rules
+      changed_when: true
+      listen: Udev reload
+
+    - name: Trigger udev device re-enumeration
+      ansible.builtin.command:
+        cmd: udevadm trigger
+      changed_when: true
+      listen: Udev reload
+
+    - name: Systemd daemon reload
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start runner service
+      ansible.builtin.systemd:
+        name: gh-actions-runner.service
+        state: started
+        enabled: true

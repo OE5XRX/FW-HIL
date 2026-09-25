@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# FW-HIL Hardware Map — fill in real values at bench setup time.
+#
+# How to find the values:
+#   probe_serial  ->  pyocd list --uid       (copy the UID string verbatim)
+#   board_iserial ->  lsusb -v -d 2fe3:0100 | grep iSerial
+#
+# After editing, re-run the Ansible playbook:
+#   ansible-playbook -i inventory/hosts.example site.yml \
+#     --extra-vars "gh_runner_token=CHANGEME"
+#
+# This file is deployed to /etc/fw-hil/hardware-map.yaml on the bench and is
+# read by fw_hil.backends.stlink.STLinkBackend at test time.
+# Do NOT commit real probe serials if they could identify physical lab location.
+
+bench:
+  stlink:
+    # pyocd --uid value; example: "003700250049005000415957070600C3 4"
+    probe_serial: "CHANGEME_PROBE_SERIAL"
+    # Stable device path created by udev rule 99-stlink.rules
+    dev_path: /dev/stlink-hil
+
+  board_cdc:
+    # OE5XRX FM-Board Zephyr composite USB device
+    vid: "0x2fe3"
+    pid: "0x0100"
+    # USB iSerial string from the board; example: "3936001D3131"
+    iserial: "CHANGEME_BOARD_ISERIAL"
+    # Stable device path created by udev rule 99-fw-hil-board.rules
+    dev_path: /dev/fm-board-cdc
+
+  twister:
+    # Must match the board name in FW-RemoteStation/boards/
+    platform: fm_board
+    # Runner as configured in FW-RemoteStation/boards/fm_board/board.cmake
+    runner: pyocd
+    # Zephyr west workspace root on the bench
+    west_workspace: /home/runner/zephyrproject

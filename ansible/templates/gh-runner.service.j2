@@ -1,0 +1,19 @@
+{# SPDX-License-Identifier: GPL-3.0-or-later #}
+[Unit]
+Description=GitHub Actions self-hosted runner for {{ gh_runner_org_url }} ({{ ansible_hostname }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ bench_user }}
+Group={{ bench_user }}
+WorkingDirectory={{ gh_runner_dir }}
+ExecStart={{ gh_runner_dir }}/run.sh
+Restart=on-failure
+RestartSec=5s
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

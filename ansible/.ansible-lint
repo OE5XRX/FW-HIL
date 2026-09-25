@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+profile: basic
+
+exclude_paths:
+  - hardware-map.yaml
+
+warn_list:
+  - latest[git]
+  - yaml[line-length]
