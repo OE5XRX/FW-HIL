@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Audio-loopback signal analysis (numpy-only, no hardware)."""
+
 from dataclasses import dataclass
 
 import numpy as np
