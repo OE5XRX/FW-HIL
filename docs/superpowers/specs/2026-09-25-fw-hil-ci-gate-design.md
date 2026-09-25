@@ -105,6 +105,21 @@ Liegen diese hinter einem dünnen **Bench-Driver-Interface**, läuft dieselbe
 Test-Suite heute auf einer Billig-Bench und später unverändert auf dem
 DebugBoard. Der DebugBoard-Umstieg ist ein **Backend-Swap**, kein Test-Rewrite.
 
+**Wichtige Präzisierung:** twisters `dut`-Fixture liefert **flash + reset +
+Konsole** bereits (Baustein 8.1). Der Bench-Driver baut das *nicht* nach — er
+liefert nur die Primitive, die twister **nicht** hat: USB-Descriptor-Zugriff,
+ALSA-Loopback, DFU-Orchestrierung und power-cycle-über-Reset-hinaus (Bausteine
+8.2–8.4).
+
+**Form (entschieden):** Der Bench-Driver ist eine dünne, importierbare
+Python-Lib **`fw_hil`** in *diesem* Repo. Sie definiert das
+`BenchDriver`-Interface + Backends (`STLinkBackend` jetzt, `DebugBoardBackend`
+später) und die Host-Verify-Helfer (USB-Descriptors, Audio-Analyse). Auf der
+Bench per Ansible `pip install -e` installiert; `FW-RemoteStation`-conftest
+importiert `fw_hil` und verdrahtet es in die twister-Fixtures. So lebt die
+Abstraktion + der Backend-Swap im Bench-Repo (Erfolgskriterium #5: DebugBoard =
+neue Backend-Klasse hier, null FW-Repo-Änderung).
+
 ### Repo-Split (bewusst, unvermeidbar)
 
 - **`FW-RemoteStation` (bleibt dort):** der FW-Loopback-Testmode (§8.4), die
@@ -239,12 +254,24 @@ Reihenfolge = fundamental/billig zuerst, teuer/FW-abhängig zuletzt.
 5. Der Umstieg auf das DebugBoard erfordert **keine** Änderung an den Testcases,
    nur am Bench-Driver-Backend.
 
-## 12. Offene Punkte (für Plan/Review)
+## 12. Geklärte Punkte
 
-- Bench-Driver-Interface: genaue Sprache/Form (reines pytest-Fixture vs. kleine
-  Python-Lib in `FW-HIL`, von twister-conftest importiert).
-- `uhubctl`-Hub jetzt beschaffen oder erst bei erstem echten USB-Hang?
-- Version-Ausleseweg für den DFU-Test (welches Shell-Command liefert die
-  laufende App-Version zuverlässig?).
+- **Bench-Driver-Form → entschieden: dünne Python-Lib `fw_hil`** in diesem Repo
+  (Option B, siehe §5). twister bleibt für flash/reset zuständig; `fw_hil`
+  liefert USB/Audio/DFU/power-cycle.
+- **`uhubctl`-Hub → zurückgestellt.** MVP-Ziel ist „schnell was zum Laufen
+  bringen"; Recovery vorerst nur via ST-Link-Reset/Mass-Erase. Hub nachrüsten,
+  falls ein echter USB-VBUS-Hang auftritt.
+- **Version-Ausleseweg → gefunden:** Shell-Command `version` gibt
+  `APP-VERSION YY.MM.DD-NN` aus, gestempelt aus `app/VERSION`
+  (Chain `app/VERSION → app_version.h → version`, vgl.
+  `tests/sim_shell/pytest/test_version.py`). DFU-Test baut v1/v2 mit
+  unterschiedlichen `app/VERSION`-Werten und asserted nach dem Swap den
+  gebumpten Wert über CDC.
+
+### Noch im Plan zu klären
+
 - Exakte UAC2-Parameter für die Descriptor-Assertion (Sample-Rate, Kanäle,
-  Endpoint-Adressen) — aus der FW-Config ziehen, nicht raten.
+  Endpoint-Adressen) — aus der FW-Config/Deskriptoren ziehen, nicht raten.
+- Genaue Form des FW-Loopback-Testmode (Kconfig-Symbol, Shell-Command-Name,
+  wo im UAC2-Datenpfad die Rückschleife sitzt).
