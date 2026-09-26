@@ -23,7 +23,7 @@
 #
 # ── After apply ──────────────────────────────────────────────────────────────
 #   1. Run `pyocd list --uid` on the bench to find the ST-Link probe serial.
-#   2. Run `lsusb -v -d 2fe3:0100 | grep iSerial` for the board serial.
+#   2. Run `lsusb -v -d 2fe3:0012 | grep iSerial` for the board serial.
 #   3. Edit /etc/fw-hil/hardware-map.yaml (deployed by this playbook) to fill
 #      in both CHANGEME placeholders, then re-run the playbook.
 ---

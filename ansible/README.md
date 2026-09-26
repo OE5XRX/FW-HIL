@@ -67,7 +67,7 @@ Re-running is always safe — all tasks are idempotent.
 
 1. Connect the ST-Link V3 and the FM-Board DeviceTester to the bench.
 2. Find the probe serial: `pyocd list --uid`
-3. Find the board serial: `lsusb -v -d 2fe3:0100 | grep iSerial`
+3. Find the board serial: `lsusb -v -d 2fe3:0012 | grep iSerial`
 4. Edit `/etc/fw-hil/hardware-map.yaml` on the bench (fill in both `CHANGEME` values).
 5. Re-run the playbook (the `force: false` on hardware-map.yaml preserves your edits).
 

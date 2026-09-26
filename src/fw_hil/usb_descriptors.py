@@ -45,7 +45,7 @@ class ExpectedComposite:
     def fm_board(cls):
         return cls(
             vid=0x2FE3,
-            pid=0x0100,
+            pid=0x0012,
             require_serial=True,
             uac2_sample_rate_hz=8000,
             uac2_channels=1,

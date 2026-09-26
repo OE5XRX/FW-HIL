@@ -48,7 +48,7 @@ from fw_hil import UsbComposite, UsbInterface
 
 device = UsbComposite(
     vid=0x2FE3,
-    pid=0x0100,
+    pid=0x0012,
     serial="OE5XRX-0001",
     interfaces=[
         UsbInterface(0x02, 0x02, 0x01),  # CDC-ACM

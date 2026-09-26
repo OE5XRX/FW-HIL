@@ -4,7 +4,7 @@
 #
 # How to find the values:
 #   probe_serial  ->  pyocd list --uid       (copy the UID string verbatim)
-#   board_iserial ->  lsusb -v -d 2fe3:0100 | grep iSerial
+#   board_iserial ->  lsusb -v -d 2fe3:0012 | grep iSerial
 #
 # After editing, re-run the Ansible playbook:
 #   ansible-playbook -i inventory/hosts.example site.yml \
@@ -24,7 +24,7 @@ bench:
   board_cdc:
     # OE5XRX FM-Board Zephyr composite USB device
     vid: "0x2fe3"
-    pid: "0x0100"
+    pid: "0x0012"
     # USB iSerial string from the board; example: "3936001D3131"
     iserial: "CHANGEME_BOARD_ISERIAL"
     # Stable device path created by udev rule 99-fw-hil-board.rules
