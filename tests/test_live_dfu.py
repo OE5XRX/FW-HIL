@@ -6,7 +6,7 @@ the version parsing and the command construction that would otherwise only be
 validated against hardware.
 """
 
-from fw_hil.dfu_backend import LiveDfuOps, parse_app_version
+from fw_hil.backends.live_dfu import LiveDfuOps, parse_app_version
 
 
 def test_parse_app_version_extracts_line():
@@ -41,10 +41,28 @@ def test_flash_baseline_cmd_with_build_dir():
     assert "--dev-id" in cmd and "35FF7006" in cmd
 
 
-def test_reset_cmd_has_target_and_probe():
-    cmd = _ops().reset_cmd()
-    assert cmd[:2] == ["pyocd", "reset"]
-    assert "stm32u575citx" in cmd and "35FF7006" in cmd
+def test_reset_delegates_to_stlink_probe():
+    # reset() must go through the shared ST-Link probe, not a duplicated argv.
+    class SpyProbe:
+        def __init__(self):
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+
+    spy = SpyProbe()
+    ops = LiveDfuOps(fw_repo_dir="/repo", probe_serial="X", boot_settle_s=0, probe=spy)
+    ops.reset()
+    assert spy.resets == 1
+
+
+def test_default_probe_is_stlink_backend_with_same_uid():
+    from fw_hil.backends.stlink import STLinkBackend
+
+    ops = _ops()
+    assert isinstance(ops.probe, STLinkBackend)
+    assert ops.probe.probe_serial == "35FF7006"
+    assert "35FF7006" in ops.probe.reset_command()
 
 
 def test_dfu_download_cmd_targets_slot_alt_and_image():

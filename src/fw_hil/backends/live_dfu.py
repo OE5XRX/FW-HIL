@@ -28,6 +28,8 @@ import re
 import subprocess
 import time
 
+from fw_hil.backends.stlink import STLinkBackend
+
 _VERSION_RE = re.compile(r"APP-VERSION\s+\d{2}\.\d{2}\.\d{2}-\d{2}")
 
 
@@ -56,20 +58,24 @@ class LiveDfuOps:
         swap_settle_s: float = 9.0,
         boot_settle_s: float = 6.0,
         run=subprocess.run,
+        probe: "STLinkBackend | None" = None,
     ):
         self.fw_repo_dir = fw_repo_dir
         self.probe_serial = probe_serial
         self.cdc_path = cdc_path
-        self.target = target
         self.vid = vid
         self.pid = pid
         self.dfu_alt = dfu_alt
-        self.pyocd = pyocd
         self.dfu_util = dfu_util
         self.west = west
         self.swap_settle_s = swap_settle_s
         self.boot_settle_s = boot_settle_s
         self._run = run
+        # The SWD probe (pyocd) is the single owner of reset/erase — reuse the
+        # ST-Link backend instead of re-building pyocd argv here.
+        self.probe = probe or STLinkBackend(
+            probe_serial=probe_serial, target=target, runner=pyocd, run=run
+        )
 
     # ── command builders (pure; unit-tested) ─────────────────────────────────
     @property
@@ -83,9 +89,6 @@ class LiveDfuOps:
         if build_dir:
             cmd += ["-d", build_dir]
         return cmd
-
-    def reset_cmd(self) -> list:
-        return [self.pyocd, "reset", "-t", self.target, "-u", self.probe_serial]
 
     def dfu_detach_cmd(self) -> list:
         return [self.dfu_util, "-e", "-d", self._usb_id]
@@ -118,7 +121,8 @@ class LiveDfuOps:
         time.sleep(self.boot_settle_s)
 
     def reset(self) -> None:
-        self._run(self.reset_cmd(), check=True)
+        # Cold-reset via the shared ST-Link (pyocd) probe — no duplicated argv.
+        self.probe.reset()
         time.sleep(self.boot_settle_s)
 
     def dfu_download(self, image_path: str, alt: "int | None" = None) -> None:
