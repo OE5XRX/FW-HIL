@@ -43,10 +43,12 @@
     gh_runner_org_url: "https://github.com/OE5XRX"
     gh_runner_labels: "self-hosted,hil,fm_board"
     # gh_runner_token: NEVER hardcode — pass via --extra-vars or ansible-vault.
-    # When it is NOT supplied, the runner is downloaded but neither registered
-    # nor started, so the box can be fully provisioned before a token exists and
-    # before "Require approval for fork-PR workflows" is enabled. Supply the
-    # token on a later (idempotent) re-run to register and start the runner.
+    # When it is NOT supplied, every runner task is skipped: the runner is
+    # neither downloaded, registered, nor started (so /opt/actions-runner will
+    # not exist after a no-token run). The box is still fully provisioned, so it
+    # can be prepared before a token exists and before "Require approval for
+    # fork-PR workflows" is enabled. Supply the token on a later (idempotent)
+    # re-run to download, register, and start the runner.
     register_runner: "{{ (gh_runner_token | default('')) | length > 0 }}"
     hw_map_dest: /etc/fw-hil
 
