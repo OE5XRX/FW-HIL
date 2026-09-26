@@ -2,12 +2,12 @@
 #
 # udev rules for the OE5XRX FM-Board USB Composite device (CDC-ACM serial port).
 #
-# VID: 0x2fe3  PID: 0x0100  (Zephyr USB_DEVICE_STACK_NEXT composite on STM32U575)
+# VID: 0x2fe3  PID: 0x0012  (Zephyr USB_DEVICE_STACK_NEXT composite on STM32U575)
 #
 # Creates a stable /dev/fm-board-cdc symlink so twister and fw_hil can address the
 # board console without relying on the enumeration-order-dependent /dev/ttyACMx path.
 #
 # If multiple boards are connected simultaneously, extend with ATTRS{serial}=="..."
-# (board iSerial from `lsusb -v -d 2fe3:0100 | grep iSerial`) and use distinct names.
+# (board iSerial from `lsusb -v -d 2fe3:0012 | grep iSerial`) and use distinct names.
 
-SUBSYSTEM=="tty", ATTRS{idVendor}=="2fe3", ATTRS{idProduct}=="0100", GROUP="dialout", MODE="0664", SYMLINK+="fm-board-cdc"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2fe3", ATTRS{idProduct}=="0012", GROUP="dialout", MODE="0664", SYMLINK+="fm-board-cdc"

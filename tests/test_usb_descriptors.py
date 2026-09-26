@@ -15,7 +15,7 @@ CDC, UAC2, DFU = 0x02, 0x01, 0xFE
 def _good():
     return UsbComposite(
         vid=0x2FE3,
-        pid=0x0100,
+        pid=0x0012,
         serial="OE5XRX-0001",
         interfaces=[
             UsbInterface(CDC, 0x02, 0x01),
