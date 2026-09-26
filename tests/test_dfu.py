@@ -56,6 +56,30 @@ def test_revert_cycle_rolls_back_unhealthy_image():
     assert res.final_version == "APP-VERSION 26.09.25-01"
 
 
+def _resets_after_dfu(log):
+    dfu_idx = next(i for i, e in enumerate(log) if e[0] == "dfu")
+    return [e for e in log[dfu_idx + 1 :] if e[0] == "reset"]
+
+
+def test_no_reset_after_dfu_in_update_cycle():
+    # Regression: the production path self-reboots; the cycle must NOT reset the
+    # device after a DFU download (the remote station has no debugger).
+    ops = FakeDfuOps()
+    run_update_cycle(
+        ops, "base.bin", "APP-VERSION 26.09.25-01", "v2.bin", "APP-VERSION 26.09.25-02"
+    )
+    assert _resets_after_dfu(ops.log) == []
+
+
+def test_no_reset_after_dfu_in_revert_cycle():
+    # Regression: an unhealthy image must revert via the MCUboot gate deadline,
+    # not via an externally forced reset.
+    _VERSIONS["bad.bin"] = "APP-VERSION 26.09.25-99"
+    ops = FakeDfuOps(revert_on={"bad.bin"})
+    run_revert_cycle(ops, "base.bin", "APP-VERSION 26.09.25-01", "bad.bin")
+    assert _resets_after_dfu(ops.log) == []
+
+
 def test_update_cycle_image_never_boots_is_failure_not_hang():
     # Review Focus: no readable version -> classified failure.
     class DeadOps(FakeDfuOps):

@@ -12,10 +12,9 @@ Implements the DFU update/revert primitives against real hardware:
   in **without any external reset** — exactly the production path (the remote
   station has no debugger). This method waits for that swap+boot+confirm to
   settle.
-- ``reset`` — cold-reset over SWD. In ``run_update_cycle`` it reboots the
-  already-confirmed new image; in ``run_revert_cycle`` it forces the still-
-  unconfirmed trial to reboot so MCUboot reverts (faster than the 30 s gate
-  deadline).
+- ``reset`` — cold-reset over SWD. Used only to boot the freshly SWD-flashed
+  baseline at the start of a cycle; it is never used to apply or revert a DFU
+  update (the firmware self-reboots and MCUboot handles the swap/revert).
 - ``read_app_version`` — the CDC ``version`` shell command.
 
 Feed this into :func:`fw_hil.dfu.run_update_cycle` / ``run_revert_cycle``.
@@ -79,10 +78,16 @@ class LiveDfuOps:
         self._run = run
         # Each external tool has one owner: the SWD probe (pyocd) and the west CLI
         # get their own backend; LiveDfuOps just orchestrates them plus dfu-util.
-        self.probe = probe or STLinkBackend(
-            probe_serial=probe_serial, target=target, runner=pyocd, run=run
+        self.probe = (
+            probe
+            if probe is not None
+            else STLinkBackend(probe_serial=probe_serial, target=target, runner=pyocd, run=run)
         )
-        self.west = west_backend or WestBackend(workspace_dir=fw_repo_dir, west=west, run=run)
+        self.west = (
+            west_backend
+            if west_backend is not None
+            else WestBackend(workspace_dir=fw_repo_dir, west=west, run=run)
+        )
 
     # ── command builders (pure; unit-tested) ─────────────────────────────────
     @property
