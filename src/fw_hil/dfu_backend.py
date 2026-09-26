@@ -23,6 +23,7 @@ Hardware-only: shells out to west/pyocd/dfu-util and reads the CDC via
 pyserial (``hw`` extra); not exercised in host CI.
 """
 
+import os
 import re
 import subprocess
 import time
@@ -75,8 +76,13 @@ class LiveDfuOps:
     def _usb_id(self) -> str:
         return f"{self.vid:04x}:{self.pid:04x}"
 
-    def flash_baseline_cmd(self) -> list:
-        return [self.west, "flash", "-r", "pyocd"]
+    def flash_baseline_cmd(self, build_dir: "str | None" = None) -> list:
+        # --dev-id pins the flash to the configured probe (same UID reset uses),
+        # so a multi-probe bench can't program the wrong board.
+        cmd = [self.west, "flash", "-r", "pyocd", "--dev-id", self.probe_serial]
+        if build_dir:
+            cmd += ["-d", build_dir]
+        return cmd
 
     def reset_cmd(self) -> list:
         return [self.pyocd, "reset", "-t", self.target, "-u", self.probe_serial]
@@ -97,9 +103,18 @@ class LiveDfuOps:
 
     # ── DfuOps protocol ──────────────────────────────────────────────────────
     def flash_baseline(self, image_path: "str | None" = None) -> None:
-        # image_path is unused: the baseline is the mcuboot+signed build in the
-        # FW-RemoteStation build dir; west flash programs both to their slots.
-        self._run(self.flash_baseline_cmd(), cwd=self.fw_repo_dir, check=True)
+        # This backend flashes a west *sysbuild* (mcuboot + signed app), not a
+        # single artifact — the two go to different slots. ``image_path`` is
+        # therefore interpreted as an optional west build DIRECTORY to flash
+        # (``west flash -d``); when None the default build in ``fw_repo_dir`` is
+        # used. Passing a raw .bin/.hex path is unsupported and raises, so a
+        # caller can't silently flash the wrong image.
+        if image_path is not None and not os.path.isdir(image_path):
+            raise ValueError(
+                f"flash_baseline expects a west build directory (sysbuild), got {image_path!r}; "
+                "pass the build dir or None to use the default build in fw_repo_dir"
+            )
+        self._run(self.flash_baseline_cmd(image_path), cwd=self.fw_repo_dir, check=True)
         time.sleep(self.boot_settle_s)
 
     def reset(self) -> None:
@@ -118,8 +133,6 @@ class LiveDfuOps:
         time.sleep(self.swap_settle_s)
 
     def read_app_version(self, timeout_s: float = 20.0) -> "str | None":
-        import os
-
         import serial
 
         deadline = time.monotonic() + timeout_s

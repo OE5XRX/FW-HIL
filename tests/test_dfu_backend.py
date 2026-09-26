@@ -30,8 +30,15 @@ def test_usb_id_is_lowercase_hex():
     assert _ops()._usb_id == "2fe3:0012"
 
 
-def test_flash_baseline_cmd_uses_pyocd_runner():
-    assert _ops().flash_baseline_cmd() == ["west", "flash", "-r", "pyocd"]
+def test_flash_baseline_cmd_pins_probe_via_dev_id():
+    cmd = _ops().flash_baseline_cmd()
+    assert cmd == ["west", "flash", "-r", "pyocd", "--dev-id", "35FF7006"]
+
+
+def test_flash_baseline_cmd_with_build_dir():
+    cmd = _ops().flash_baseline_cmd("/repo/build")
+    assert cmd[-2:] == ["-d", "/repo/build"]
+    assert "--dev-id" in cmd and "35FF7006" in cmd
 
 
 def test_reset_cmd_has_target_and_probe():
@@ -64,5 +71,13 @@ def test_flash_baseline_invokes_runner_in_repo_dir():
     )
     ops.flash_baseline()
     cmd, kw = calls[0]
-    assert cmd == ["west", "flash", "-r", "pyocd"]
+    assert cmd == ["west", "flash", "-r", "pyocd", "--dev-id", "X"]
     assert kw.get("cwd") == "/repo"
+
+
+def test_flash_baseline_rejects_raw_artifact_path():
+    import pytest
+
+    ops = LiveDfuOps(fw_repo_dir="/repo", probe_serial="X", run=lambda *a, **k: None)
+    with pytest.raises(ValueError):
+        ops.flash_baseline("/tmp/zephyr.signed.bin")  # a file, not a build dir
