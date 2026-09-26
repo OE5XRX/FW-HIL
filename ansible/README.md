@@ -7,7 +7,7 @@ as the OE5XRX Hardware-in-the-Loop CI bench.
 
 | Component | Method | Notes |
 |-----------|--------|-------|
-| Zephyr SDK 0.17.0 (ARM only) | tar.xz extracted to `/opt` | minimal install + `arm-zephyr-eabi` toolchain |
+| Zephyr SDK 1.0.1 (ARM only) | tar.xz extracted to `/opt` | minimal install + `arm-zephyr-eabi` toolchain; matches the Zephyr rev the firmware pins |
 | `west`, `pyocd` | pip venv `/opt/fw-hil-venv` | |
 | `openocd`, `dfu-util`, `alsa-utils` | apt | |
 | `fw_hil` (this repo) | `pip install -e` in venv | cloned to `/opt/fw-hil` |
@@ -79,3 +79,25 @@ ansible-lint .
 ```
 
 CI runs `ansible-lint` + `--syntax-check` on every push (see `.github/workflows/ci.yml`).
+
+## Building & flashing firmware (build-env)
+
+The playbook makes the box **build-capable** (Zephyr SDK, `west`/`pyocd` venv owned
+by the bench user, `acl`, udev, pyocd STM32U5 pack). It does **not** set up a
+per-firmware west workspace — that is repo/revision-specific and belongs to the
+build step (the `hil` CI job, or a manual run). The one-time workspace setup:
+
+```sh
+sudo -u hil -H bash -lc '
+  export PATH=/opt/fw-hil-venv/bin:$PATH
+  export ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk-1.0.1
+  cd ~ && west init -m https://github.com/OE5XRX/FW-RemoteStation --mr main zephyrproject
+  cd zephyrproject && west update && west patch apply
+  west packages pip --install      # installs the Zephyr rev'"'"'s Python build deps into the venv
+  cd FW-RemoteStation && west build -b fm_board app && west flash -r pyocd
+'
+```
+
+`ZEPHYR_SDK_INSTALL_DIR` must be exported for the build (the SDK is installed but
+not globally registered). `west packages pip --install` needs the venv writable by
+the bench user — the playbook's ownership handoff ensures that.

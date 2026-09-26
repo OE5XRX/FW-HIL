@@ -34,7 +34,7 @@
   vars:
     bench_user: hil
     venv_path: /opt/fw-hil-venv
-    zephyr_sdk_version: "0.17.0"
+    zephyr_sdk_version: "1.0.1"
     zephyr_sdk_dir: "/opt/zephyr-sdk-{{ zephyr_sdk_version }}"
     fw_hil_repo_url: "https://github.com/OE5XRX/FW-HIL.git"
     fw_hil_dir: /opt/fw-hil
@@ -136,6 +136,10 @@
         cmd: "{{ venv_path }}/bin/pyocd pack install stm32u575citx"
       become: true
       become_user: "{{ bench_user }}"
+      # become_user does not set $HOME; without this the pack lands in the wrong
+      # cache and the runner (as bench_user) can't find the target.
+      environment:
+        HOME: "/home/{{ bench_user }}"
       register: pyocd_pack
       changed_when: "'Downloading packs' in pyocd_pack.stdout"
 
@@ -156,7 +160,7 @@
     - name: Run Zephyr SDK setup for ARM toolchain
       ansible.builtin.command:
         cmd: "{{ zephyr_sdk_dir }}/setup.sh -t arm-zephyr-eabi -h"
-        creates: "{{ zephyr_sdk_dir }}/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc"
+        creates: "{{ zephyr_sdk_dir }}/gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc"
       changed_when: true  # only executes when creates target is absent
 
     # ── Clone and install fw_hil ──────────────────────────────────────────────
@@ -173,6 +177,16 @@
         extra_args: "--editable"
         state: present
         virtualenv: "{{ venv_path }}"
+
+    - name: Hand the venv to the bench user
+      # The venv is created and populated as root; the bench user (which runs
+      # builds/flashes) must own it so a later `west packages pip --install`
+      # (Zephyr build deps, per-workspace) can write into it without sudo.
+      ansible.builtin.file:
+        path: "{{ venv_path }}"
+        owner: "{{ bench_user }}"
+        group: "{{ bench_user }}"
+        recurse: true
 
     # ── udev rules ────────────────────────────────────────────────────────────
     - name: Install ST-Link udev rules
