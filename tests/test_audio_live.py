@@ -11,9 +11,10 @@ serial fakes (no hardware, no numpy-import surprises).
 import numpy as np
 import pytest
 
-from fw_hil.audio_analysis import generate_sine
+from fw_hil.audio_analysis import analyze_loopback, generate_sine
 from fw_hil.audio_live import (
     LiveAudioLoopback,
+    align_capture,
     float_to_s16le,
     parse_alsa_cards,
     resolve_alsa_device,
@@ -64,6 +65,43 @@ def test_float_s16_roundtrip_preserves_signal():
     back = s16le_to_float(raw)
     # quantisation error is bounded by 1 LSB / full-scale
     assert np.max(np.abs(back - ref)) < 1e-3
+
+
+# ── capture-window alignment (Copilot: expected pre/post-roll silence) ────────
+def test_align_capture_trims_pre_and_post_roll_silence():
+    # A realistic capture: arecord brackets the tone with leading + trailing
+    # silence. Scored raw, that silence reads as dropouts and fails a clean
+    # board; aligned, it must score ok.
+    ref = generate_sine(1000.0, 0.5)
+    captured = np.concatenate(
+        [
+            np.zeros(1600, np.float32),  # ~0.2 s pre-roll (arecord before aplay)
+            ref,
+            np.zeros(4000, np.float32),  # ~0.5 s post-roll (arecord after aplay)
+        ]
+    )
+    raw = analyze_loopback(ref, captured)
+    assert raw.ok is False  # the bug Copilot flagged: silence counted as dropouts
+    aligned = align_capture(ref, captured)
+    assert aligned.shape == ref.shape
+    good = analyze_loopback(ref, aligned)
+    assert good.ok is True
+    assert good.dropout_count == 0
+
+
+def test_align_capture_passes_through_when_no_signal():
+    # All-silence capture -> no locatable tone -> returned unchanged so a real
+    # failure still scores as a failure (not masked by trimming).
+    ref = generate_sine(1000.0, 0.5)
+    silent = np.zeros(ref.size, np.float32)
+    out = align_capture(ref, silent)
+    assert analyze_loopback(ref, out).ok is False
+
+
+# ── channel-count guard (Copilot: mono-only processing) ───────────────────────
+def test_multichannel_is_rejected():
+    with pytest.raises(ValueError, match="mono only"):
+        LiveAudioLoopback(channels=2)
 
 
 # ── CDC loopback command construction ─────────────────────────────────────────

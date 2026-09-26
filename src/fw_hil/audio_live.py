@@ -33,7 +33,7 @@ import subprocess
 
 import numpy as np
 
-from fw_hil.audio_analysis import analyze_loopback, generate_sine
+from fw_hil.audio_analysis import analyze_loopback, find_lag, generate_sine
 
 FM_BOARD_VID = 0x2FE3
 FM_BOARD_PID = 0x0012
@@ -88,6 +88,28 @@ def s16le_to_float(raw: bytes):
     return (np.frombuffer(bytes(raw), dtype="<i2").astype(np.float32) / 32768.0).copy()
 
 
+def align_capture(reference, captured, sample_rate=8000):
+    """Trim ``captured`` to the reference-length window aligned at the tone onset.
+
+    ``arecord`` is started before ``aplay`` and stopped after it, so a real
+    capture brackets the played tone with pre/post-roll silence. Handed straight
+    to :func:`analyze_loopback`, that silence is scored as dropouts across the
+    full buffer and even a clean board exceeds the dropout limit. We use the
+    cross-correlation lag to slice out just the played window before scoring.
+
+    If the tone can't be located (empty/too-short capture, or a lag that runs
+    off the front), the capture is returned unchanged so a genuinely failed
+    loopback still scores as failed rather than being masked by trimming.
+    """
+    captured = np.asarray(captured)
+    if captured.size < reference.size:
+        return captured
+    lag, _corr = find_lag(reference, captured, sample_rate)
+    if lag < 0:
+        return captured
+    return captured[lag : lag + reference.size]
+
+
 class LiveAudioLoopback:
     """Orchestrate a UAC2 loopback check against the physical fm_board.
 
@@ -119,6 +141,16 @@ class LiveAudioLoopback:
         send_command=None,
         play_capture=None,
     ):
+        # The fm_board UAC2 stream is mono (ExpectedComposite.fm_board()), and the
+        # reference/capture path here is single-channel end to end: generate_sine
+        # yields a 1-D array and s16le_to_float returns interleaved samples as-is.
+        # Multichannel would need interleave/deinterleave that isn't built, so we
+        # reject it up front rather than silently mis-scoring a stereo buffer.
+        if channels != 1:
+            raise ValueError(
+                f"channels={channels} unsupported: the loopback path is mono only "
+                "(interleave/deinterleave is not implemented)"
+            )
         self.cdc_path = cdc_path
         self.card_hint = card_hint
         self._playback_device = playback_device
@@ -222,7 +254,8 @@ class LiveAudioLoopback:
             captured = play_capture(reference)
         finally:
             send(self.loopback_off_command())
-        return analyze_loopback(reference, captured, sample_rate=self.sample_rate)
+        aligned = align_capture(reference, captured, sample_rate=self.sample_rate)
+        return analyze_loopback(reference, aligned, sample_rate=self.sample_rate)
 
     # ── real hardware I/O (lazy import; injectable; not run in host CI) ───────
     def _sleep(self, seconds: float) -> None:
@@ -262,6 +295,11 @@ class LiveAudioLoopback:
                 self._sleep(0.2)  # let arecord open the device before we play
                 self._run(self.aplay_cmd(playback, ref_path), check=True)
             finally:
-                rec.wait()
+                rc = rec.wait()
+            # Don't score a capture that never happened: a non-zero arecord exit
+            # means the recording failed (device busy, wrong format, …) and
+            # cap_path is empty/garbage, so surface it instead of a bogus result.
+            if rc != 0:
+                raise RuntimeError(f"arecord exited with status {rc}")
             with open(cap_path, "rb") as fh:
                 return s16le_to_float(fh.read())
