@@ -9,7 +9,10 @@
 # distinct SYMLINK names (e.g. stlink-hil-0, stlink-hil-1).  The probe serial is
 # obtained from `pyocd list --uid` and stored in /etc/fw-hil/hardware-map.yaml.
 
-# ST-LINK/V2
+# ST-LINK/V2 (standalone dongle)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="3748", GROUP="plugdev", MODE="0664", SYMLINK+="stlink-hil"
+
+# ST-LINK/V2-1 (Nucleo onboard)
 SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="374b", GROUP="plugdev", MODE="0664", SYMLINK+="stlink-hil"
 
 # ST-LINK/V3E  (most common for STM32U5 + Nucleo boards)
