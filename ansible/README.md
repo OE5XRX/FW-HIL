@@ -33,6 +33,21 @@ ansible-playbook --check -i inventory/hosts.example site.yml \
   --extra-vars "gh_runner_token=CHANGEME"
 ```
 
+## Provision without registering the runner
+
+If `gh_runner_token` is **not** supplied, the box is fully provisioned
+(packages, Zephyr SDK, venv, `fw_hil`, udev rules, `hil` user) but the GitHub
+Actions runner is neither downloaded nor started. Use this to prepare the bench
+before a token exists and before "Require approval for fork-PR workflows" is
+enabled:
+
+```sh
+cd ansible/
+ansible-playbook -i inventory/hosts site.yml
+```
+
+Supply the token on a later (idempotent) re-run to register and start the runner.
+
 ## Full apply
 
 1. Copy `inventory/hosts.example` to `inventory/hosts` and set the bench IP.
