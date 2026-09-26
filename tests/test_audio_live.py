@@ -82,7 +82,8 @@ def test_align_capture_trims_pre_and_post_roll_silence():
     )
     raw = analyze_loopback(ref, captured)
     assert raw.ok is False  # the bug Copilot flagged: silence counted as dropouts
-    aligned = align_capture(ref, captured)
+    lag, aligned = align_capture(ref, captured)
+    assert lag == 1600  # onset located = real latency, reported separately
     assert aligned.shape == ref.shape
     good = analyze_loopback(ref, aligned)
     assert good.ok is True
@@ -94,8 +95,20 @@ def test_align_capture_passes_through_when_no_signal():
     # failure still scores as a failure (not masked by trimming).
     ref = generate_sine(1000.0, 0.5)
     silent = np.zeros(ref.size, np.float32)
-    out = align_capture(ref, silent)
+    lag, out = align_capture(ref, silent)
+    assert lag is None
     assert analyze_loopback(ref, out).ok is False
+
+
+def test_align_capture_rejects_out_of_bounds_lag():
+    # A late onset that leaves no room for a full reference window must be
+    # treated as unlocatable, not sliced into a short high-correlation overlap.
+    ref = generate_sine(1000.0, 0.5)
+    captured = np.concatenate([np.zeros(200, np.float32), ref])[: ref.size + 50]
+    assert captured.size >= ref.size  # first guard doesn't apply
+    lag, out = align_capture(ref, captured)
+    assert lag is None
+    assert out.size == captured.size  # unchanged, not truncated
 
 
 # ── channel-count guard (Copilot: mono-only processing) ───────────────────────
@@ -173,6 +186,10 @@ def test_run_loopback_success_synthetic():
     result = lb.run_loopback()
     assert result.ok is True
     assert result.correlation > 0.99
+    # the real playback->capture latency is preserved on the result even though
+    # scoring runs on the trimmed (lag-reset) window
+    assert result.lag_samples == 16
+    assert result.latency_s == 16 / 8000
     # on before off, both sent
     assert rec.commands == ["audio loopback on", "audio loopback off"]
 

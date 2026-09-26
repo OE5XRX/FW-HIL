@@ -30,10 +30,16 @@ imported and injectable — so host CI runs this without ALSA, pyserial or a boa
 import math
 import re
 import subprocess
+from dataclasses import replace
 
 import numpy as np
 
-from fw_hil.audio_analysis import analyze_loopback, find_lag, generate_sine
+from fw_hil.audio_analysis import (
+    analyze_loopback,
+    find_lag,
+    generate_sine,
+    lag_to_latency_s,
+)
 
 FM_BOARD_VID = 0x2FE3
 FM_BOARD_PID = 0x0012
@@ -89,7 +95,7 @@ def s16le_to_float(raw: bytes):
 
 
 def align_capture(reference, captured, sample_rate=8000):
-    """Trim ``captured`` to the reference-length window aligned at the tone onset.
+    """Locate the played tone in ``captured``; return ``(lag, window)``.
 
     ``arecord`` is started before ``aplay`` and stopped after it, so a real
     capture brackets the played tone with pre/post-roll silence. Handed straight
@@ -97,17 +103,22 @@ def align_capture(reference, captured, sample_rate=8000):
     full buffer and even a clean board exceeds the dropout limit. We use the
     cross-correlation lag to slice out just the played window before scoring.
 
-    If the tone can't be located (empty/too-short capture, or a lag that runs
-    off the front), the capture is returned unchanged so a genuinely failed
-    loopback still scores as failed rather than being masked by trimming.
+    ``lag`` is the samples from capture start to the tone onset — i.e. the real
+    playback->capture latency — and is meant to be reported on the result even
+    though scoring runs on the trimmed ``window``. Returns ``(None, captured)``
+    (capture unchanged) when the tone can't be confidently located: a capture
+    shorter than the reference, a negative lag, or a lag so late that a full
+    reference-length window won't fit (which would otherwise let a cut-off tone
+    score on a short, misleadingly high-correlation overlap). Leaving it
+    untrimmed keeps a genuine failure scoring as a failure.
     """
     captured = np.asarray(captured)
     if captured.size < reference.size:
-        return captured
+        return None, captured
     lag, _corr = find_lag(reference, captured, sample_rate)
-    if lag < 0:
-        return captured
-    return captured[lag : lag + reference.size]
+    if lag < 0 or lag + reference.size > captured.size:
+        return None, captured
+    return lag, captured[lag : lag + reference.size]
 
 
 class LiveAudioLoopback:
@@ -254,8 +265,18 @@ class LiveAudioLoopback:
             captured = play_capture(reference)
         finally:
             send(self.loopback_off_command())
-        aligned = align_capture(reference, captured, sample_rate=self.sample_rate)
-        return analyze_loopback(reference, aligned, sample_rate=self.sample_rate)
+        # Score dropouts/SNR/correlation on the trimmed window (pre/post-roll
+        # silence removed), but report the *original* capture lag as the real
+        # playback->capture latency — trimming resets the window's own lag to ~0.
+        lag, aligned = align_capture(reference, captured, sample_rate=self.sample_rate)
+        result = analyze_loopback(reference, aligned, sample_rate=self.sample_rate)
+        if lag is not None:
+            result = replace(
+                result,
+                lag_samples=lag,
+                latency_s=lag_to_latency_s(lag, self.sample_rate),
+            )
+        return result
 
     # ── real hardware I/O (lazy import; injectable; not run in host CI) ───────
     def _sleep(self, seconds: float) -> None:
