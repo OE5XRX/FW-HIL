@@ -124,6 +124,20 @@
         state: present
         virtualenv: "{{ venv_path }}"
 
+    - name: Install pyocd CMSIS pack for the fm_board target (STM32U5)
+      # pyocd has no built-in STM32U5 target; the flash/debug runner needs the
+      # Keil.STM32U5xx_DFP pack for stm32u575citx. Idempotent: a re-run with the
+      # pack already present downloads nothing.
+      # Run as the bench user: pyocd's pack manager caches per-user
+      # (~/.local/share/cmsis-pack-manager), so it must land in the runner's
+      # home, not root's.
+      ansible.builtin.command:
+        cmd: "{{ venv_path }}/bin/pyocd pack install stm32u575citx"
+      become: true
+      become_user: "{{ bench_user }}"
+      register: pyocd_pack
+      changed_when: "'Downloading packs' in pyocd_pack.stdout"
+
     # ── Zephyr SDK ────────────────────────────────────────────────────────────
     - name: Download Zephyr SDK minimal archive
       ansible.builtin.get_url:
