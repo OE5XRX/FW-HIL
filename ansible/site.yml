@@ -32,7 +32,7 @@
   become: true
 
   vars:
-    bench_user: runner
+    bench_user: hil
     venv_path: /opt/fw-hil-venv
     zephyr_sdk_version: "0.17.0"
     zephyr_sdk_dir: "/opt/zephyr-sdk-{{ zephyr_sdk_version }}"
@@ -42,7 +42,14 @@
     gh_runner_dir: /opt/actions-runner
     gh_runner_org_url: "https://github.com/OE5XRX"
     gh_runner_labels: "self-hosted,hil,fm_board"
-    # gh_runner_token: NEVER hardcode — pass via --extra-vars or ansible-vault
+    # gh_runner_token: NEVER hardcode — pass via --extra-vars or ansible-vault.
+    # When it is NOT supplied, every runner task is skipped: the runner is
+    # neither downloaded, registered, nor started (so /opt/actions-runner will
+    # not exist after a no-token run). The box is still fully provisioned, so it
+    # can be prepared before a token exists and before "Require approval for
+    # fork-PR workflows" is enabled. Supply the token on a later (idempotent)
+    # re-run to download, register, and start the runner.
+    register_runner: "{{ (gh_runner_token | default('')) | length > 0 }}"
     hw_map_dest: /etc/fw-hil
 
   tasks:
@@ -197,12 +204,14 @@
         owner: "{{ bench_user }}"
         group: "{{ bench_user }}"
         mode: "0755"
+      when: register_runner
 
     - name: Download GitHub Actions runner archive
       ansible.builtin.get_url:
         url: "https://github.com/actions/runner/releases/download/v{{ gh_runner_version }}/actions-runner-linux-x64-{{ gh_runner_version }}.tar.gz"
         dest: "/tmp/actions-runner-{{ gh_runner_version }}.tar.gz"
         mode: "0644"
+      when: register_runner
 
     - name: Extract GitHub Actions runner
       ansible.builtin.unarchive:
@@ -210,6 +219,7 @@
         dest: "{{ gh_runner_dir }}"
         remote_src: true
         creates: "{{ gh_runner_dir }}/run.sh"
+      when: register_runner
 
     - name: Set runner directory ownership
       ansible.builtin.file:
@@ -217,11 +227,13 @@
         owner: "{{ bench_user }}"
         group: "{{ bench_user }}"
         recurse: true
+      when: register_runner
 
     - name: Check if runner is already configured
       ansible.builtin.stat:
         path: "{{ gh_runner_dir }}/.runner"
       register: runner_configured
+      when: register_runner
 
     - name: Configure GitHub Actions runner
       ansible.builtin.command:
@@ -236,8 +248,8 @@
         chdir: "{{ gh_runner_dir }}"
       become: true
       become_user: "{{ bench_user }}"
-      when: not runner_configured.stat.exists
-      changed_when: not runner_configured.stat.exists
+      when: register_runner and not runner_configured.stat.exists
+      changed_when: register_runner and not runner_configured.stat.exists
       no_log: true
 
     - name: Deploy runner systemd service unit
@@ -247,6 +259,7 @@
         owner: root
         group: root
         mode: "0644"
+      when: register_runner
       notify:
         - Systemd daemon reload
         - Enable and start runner service

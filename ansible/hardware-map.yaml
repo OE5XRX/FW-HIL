@@ -36,4 +36,4 @@ bench:
     # Runner as configured in FW-RemoteStation/boards/fm_board/board.cmake
     runner: pyocd
     # Zephyr west workspace root on the bench
-    west_workspace: /home/runner/zephyrproject
+    west_workspace: /home/hil/zephyrproject
