@@ -171,9 +171,11 @@
         version: main  # noqa: latest[git]
         update: true
 
-    - name: Install fw_hil package in editable mode
+    - name: Install fw_hil package (with hardware extra) in editable mode
+      # [hw] pulls in pyusb for the live USB reader (Baustein 3); libusb is
+      # provided by libusb-1.0-0-dev in the apt list above.
       ansible.builtin.pip:
-        name: "{{ fw_hil_dir }}"
+        name: "{{ fw_hil_dir }}[hw]"
         extra_args: "--editable"
         state: present
         virtualenv: "{{ venv_path }}"
