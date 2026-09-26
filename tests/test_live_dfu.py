@@ -30,17 +30,6 @@ def test_usb_id_is_lowercase_hex():
     assert _ops()._usb_id == "2fe3:0012"
 
 
-def test_flash_baseline_cmd_pins_probe_via_dev_id():
-    cmd = _ops().flash_baseline_cmd()
-    assert cmd == ["west", "flash", "-r", "pyocd", "--dev-id", "35FF7006"]
-
-
-def test_flash_baseline_cmd_with_build_dir():
-    cmd = _ops().flash_baseline_cmd("/repo/build")
-    assert cmd[-2:] == ["-d", "/repo/build"]
-    assert "--dev-id" in cmd and "35FF7006" in cmd
-
-
 def test_reset_delegates_to_stlink_probe():
     # reset() must go through the shared ST-Link probe, not a duplicated argv.
     class SpyProbe:
@@ -79,18 +68,25 @@ def test_dfu_download_cmd_alt_override():
     assert cmd[i + 1] == "1"
 
 
-def test_flash_baseline_invokes_runner_in_repo_dir():
+def test_default_west_backend_targets_workspace():
+    from fw_hil.backends.west import WestBackend
+
+    ops = _ops()
+    assert isinstance(ops.west, WestBackend)
+    assert ops.west.workspace_dir == "/home/hil/zephyrproject/FW-RemoteStation"
+
+
+def test_flash_baseline_delegates_to_west_with_probe_and_build_dir(tmp_path):
     calls = []
-    ops = LiveDfuOps(
-        fw_repo_dir="/repo",
-        probe_serial="X",
-        boot_settle_s=0,
-        run=lambda cmd, **kw: calls.append((cmd, kw)),
-    )
-    ops.flash_baseline()
-    cmd, kw = calls[0]
-    assert cmd == ["west", "flash", "-r", "pyocd", "--dev-id", "X"]
-    assert kw.get("cwd") == "/repo"
+
+    class SpyWest:
+        def flash(self, runner="pyocd", dev_id=None, build_dir=None):
+            calls.append((runner, dev_id, build_dir))
+
+    ops = LiveDfuOps(fw_repo_dir="/repo", probe_serial="X", boot_settle_s=0, west_backend=SpyWest())
+    build = str(tmp_path)
+    ops.flash_baseline(build)
+    assert calls == [("pyocd", "X", build)]
 
 
 def test_flash_baseline_rejects_raw_artifact_path():
