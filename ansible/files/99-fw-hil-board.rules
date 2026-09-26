@@ -11,3 +11,8 @@
 # (board iSerial from `lsusb -v -d 2fe3:0012 | grep iSerial`) and use distinct names.
 
 SUBSYSTEM=="tty", ATTRS{idVendor}=="2fe3", ATTRS{idProduct}=="0012", GROUP="dialout", MODE="0664", SYMLINK+="fm-board-cdc"
+
+# Raw USB device access for dfu-util (DFU download) and pyusb (descriptor reads
+# / UAC2 clock) as the bench user via plugdev — in both run-time and DFU mode
+# (same VID/PID). Without this only root can drive the DFU/USB-enum bausteine.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fe3", ATTR{idProduct}=="0012", GROUP="plugdev", MODE="0664"

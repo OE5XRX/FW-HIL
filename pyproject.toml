@@ -15,7 +15,7 @@ dependencies = ["numpy>=2.1"]
 dev = ["pytest>=8.3", "ruff>=0.6"]
 # Hardware/bench extra: live USB reader (Baustein 3). Not needed for the
 # host-only unit tests, so CI stays pyusb-free; installed on the bench.
-hw = ["pyusb>=1.2"]
+hw = ["pyusb>=1.2", "pyserial>=3.5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
