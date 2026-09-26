@@ -12,10 +12,9 @@ Implements the DFU update/revert primitives against real hardware:
   in **without any external reset** — exactly the production path (the remote
   station has no debugger). This method waits for that swap+boot+confirm to
   settle.
-- ``reset`` — cold-reset over SWD. In ``run_update_cycle`` it reboots the
-  already-confirmed new image; in ``run_revert_cycle`` it forces the still-
-  unconfirmed trial to reboot so MCUboot reverts (faster than the 30 s gate
-  deadline).
+- ``reset`` — cold-reset over SWD. Used only to boot the freshly SWD-flashed
+  baseline at the start of a cycle; it is never used to apply or revert a DFU
+  update (the firmware self-reboots and MCUboot handles the swap/revert).
 - ``read_app_version`` — the CDC ``version`` shell command.
 
 Feed this into :func:`fw_hil.dfu.run_update_cycle` / ``run_revert_cycle``.
@@ -27,6 +26,9 @@ import os
 import re
 import subprocess
 import time
+
+from fw_hil.backends.stlink import STLinkBackend
+from fw_hil.backends.west import WestBackend
 
 _VERSION_RE = re.compile(r"APP-VERSION\s+\d{2}\.\d{2}\.\d{2}-\d{2}")
 
@@ -53,39 +55,44 @@ class LiveDfuOps:
         pyocd: str = "pyocd",
         dfu_util: str = "dfu-util",
         west: str = "west",
-        swap_settle_s: float = 9.0,
+        post_dfu_settle_s: float = 45.0,
         boot_settle_s: float = 6.0,
         run=subprocess.run,
+        probe: "STLinkBackend | None" = None,
+        west_backend: "WestBackend | None" = None,
     ):
-        self.fw_repo_dir = fw_repo_dir
         self.probe_serial = probe_serial
         self.cdc_path = cdc_path
-        self.target = target
         self.vid = vid
         self.pid = pid
         self.dfu_alt = dfu_alt
-        self.pyocd = pyocd
         self.dfu_util = dfu_util
-        self.west = west
-        self.swap_settle_s = swap_settle_s
+        # Long enough to cover the firmware's post-download outcome WITHOUT an
+        # external reset: self-reboot + MCUboot swap + trial boot + either the
+        # health-gate confirm (~few s) or the GATE_DEADLINE_MS revert (~30 s) +
+        # revert-swap + baseline boot. So after dfu_download the board is in its
+        # final state (confirmed-new OR reverted-baseline) and read_app_version
+        # reads the real outcome — the production path (the station never resets).
+        self.post_dfu_settle_s = post_dfu_settle_s
         self.boot_settle_s = boot_settle_s
         self._run = run
+        # Each external tool has one owner: the SWD probe (pyocd) and the west CLI
+        # get their own backend; LiveDfuOps just orchestrates them plus dfu-util.
+        self.probe = (
+            probe
+            if probe is not None
+            else STLinkBackend(probe_serial=probe_serial, target=target, runner=pyocd, run=run)
+        )
+        self.west = (
+            west_backend
+            if west_backend is not None
+            else WestBackend(workspace_dir=fw_repo_dir, west=west, run=run)
+        )
 
     # ── command builders (pure; unit-tested) ─────────────────────────────────
     @property
     def _usb_id(self) -> str:
         return f"{self.vid:04x}:{self.pid:04x}"
-
-    def flash_baseline_cmd(self, build_dir: "str | None" = None) -> list:
-        # --dev-id pins the flash to the configured probe (same UID reset uses),
-        # so a multi-probe bench can't program the wrong board.
-        cmd = [self.west, "flash", "-r", "pyocd", "--dev-id", self.probe_serial]
-        if build_dir:
-            cmd += ["-d", build_dir]
-        return cmd
-
-    def reset_cmd(self) -> list:
-        return [self.pyocd, "reset", "-t", self.target, "-u", self.probe_serial]
 
     def dfu_detach_cmd(self) -> list:
         return [self.dfu_util, "-e", "-d", self._usb_id]
@@ -114,11 +121,12 @@ class LiveDfuOps:
                 f"flash_baseline expects a west build directory (sysbuild), got {image_path!r}; "
                 "pass the build dir or None to use the default build in fw_repo_dir"
             )
-        self._run(self.flash_baseline_cmd(image_path), cwd=self.fw_repo_dir, check=True)
+        self.west.flash(runner="pyocd", dev_id=self.probe_serial, build_dir=image_path)
         time.sleep(self.boot_settle_s)
 
     def reset(self) -> None:
-        self._run(self.reset_cmd(), check=True)
+        # Cold-reset via the shared ST-Link (pyocd) probe — no duplicated argv.
+        self.probe.reset()
         time.sleep(self.boot_settle_s)
 
     def dfu_download(self, image_path: str, alt: "int | None" = None) -> None:
@@ -126,11 +134,12 @@ class LiveDfuOps:
         self._run(self.dfu_detach_cmd(), check=False)
         time.sleep(3.0)
         self._run(self.dfu_download_cmd(image_path, alt), check=True)
-        # Firmware self-reboots (~500 ms) -> MCUboot swap -> trial boot -> the
-        # health gate confirms a healthy image within its dwell. Wait it out so
-        # a healthy image is confirmed before the caller's reset() reboots it
-        # (an unconfirmed reboot would revert).
-        time.sleep(self.swap_settle_s)
+        # No external reset: the firmware self-reboots (~500 ms) and MCUboot
+        # swaps the trial in. Wait for the outcome to settle — a healthy image
+        # confirms within its dwell; an unhealthy one is reverted by MCUboot
+        # after the health-gate deadline. This is the production path (the
+        # station has no debugger and never resets after a DFU download).
+        time.sleep(self.post_dfu_settle_s)
 
     def read_app_version(self, timeout_s: float = 20.0) -> "str | None":
         import serial

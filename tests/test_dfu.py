@@ -5,27 +5,34 @@ _VERSIONS = {"base.bin": "APP-VERSION 26.09.25-01", "v2.bin": "APP-VERSION 26.09
 
 
 class FakeDfuOps:
-    """Simulates a board: tracks the version the next boot will report."""
+    """Simulates the board's production DFU behavior.
+
+    ``reset`` boots the SWD-flashed baseline; ``dfu_download`` self-completes
+    (firmware self-reboot + MCUboot swap) with NO external reset — a healthy
+    image sticks, an unhealthy one (``revert_on``) is reverted by MCUboot after
+    the gate deadline, leaving the previous baseline running.
+    """
 
     def __init__(self, revert_on=()):
         self.current = None
         self.revert_on = set(revert_on)  # images that fail the health-gate
         self.log = []
-        self._pending = None
+        self._flashed = None
 
     def flash_baseline(self, image_path):
         self.log.append(("flash", image_path))
-        self._pending = image_path
-
-    def dfu_download(self, image_path, alt):
-        self.log.append(("dfu", image_path, alt))
-        self._pending = image_path
+        self._flashed = image_path
 
     def reset(self):
         self.log.append(("reset",))
-        # unhealthy image reverts to whatever was 'current' before it
-        if self._pending not in self.revert_on:
-            self.current = _VERSIONS[self._pending]
+        self.current = _VERSIONS[self._flashed]  # boot the flashed baseline
+
+    def dfu_download(self, image_path, alt):
+        self.log.append(("dfu", image_path, alt))
+        # self-reboot + swap + (confirm | deadline revert): no reset needed.
+        if image_path not in self.revert_on:
+            self.current = _VERSIONS[image_path]
+        # else: unhealthy -> reverted -> current (baseline) unchanged
 
     def read_app_version(self, timeout_s=20.0):
         return self.current
@@ -44,12 +51,33 @@ def test_happy_path_new_version_sticks():
 def test_revert_cycle_rolls_back_unhealthy_image():
     _VERSIONS["bad.bin"] = "APP-VERSION 26.09.25-99"
     ops = FakeDfuOps(revert_on={"bad.bin"})
-    # establish baseline current before the test
-    ops.flash_baseline("base.bin")
-    ops.reset()
     res = run_revert_cycle(ops, "base.bin", "APP-VERSION 26.09.25-01", "bad.bin")
     assert res.ok and res.reverted
     assert res.final_version == "APP-VERSION 26.09.25-01"
+
+
+def _resets_after_dfu(log):
+    dfu_idx = next(i for i, e in enumerate(log) if e[0] == "dfu")
+    return [e for e in log[dfu_idx + 1 :] if e[0] == "reset"]
+
+
+def test_no_reset_after_dfu_in_update_cycle():
+    # Regression: the production path self-reboots; the cycle must NOT reset the
+    # device after a DFU download (the remote station has no debugger).
+    ops = FakeDfuOps()
+    run_update_cycle(
+        ops, "base.bin", "APP-VERSION 26.09.25-01", "v2.bin", "APP-VERSION 26.09.25-02"
+    )
+    assert _resets_after_dfu(ops.log) == []
+
+
+def test_no_reset_after_dfu_in_revert_cycle():
+    # Regression: an unhealthy image must revert via the MCUboot gate deadline,
+    # not via an externally forced reset.
+    _VERSIONS["bad.bin"] = "APP-VERSION 26.09.25-99"
+    ops = FakeDfuOps(revert_on={"bad.bin"})
+    run_revert_cycle(ops, "base.bin", "APP-VERSION 26.09.25-01", "bad.bin")
+    assert _resets_after_dfu(ops.log) == []
 
 
 def test_update_cycle_image_never_boots_is_failure_not_hang():
