@@ -102,6 +102,9 @@ There is **no INPUT or FORWARD filtering** — the table exists solely to fence
 `hil`'s egress. Because admin/ssh/management traffic is never touched, there is
 **no lockout risk** (this replaces the earlier "ssh-first, default-drop input"
 design). The `hil` UID is resolved at apply time via `getent` (not hardcoded).
+The ruleset replaces **only its own `fw_hil_egress` table** (it does not
+`flush ruleset`), so any unrelated nftables tables on the host — UFW, Docker,
+operator rules — are left intact on every enable and refresh.
 
 The DNS allowlist is derived from `egress_dns_servers` (default: the host's
 `/etc/resolv.conf` nameservers). On a **systemd-resolved** host (the Ubuntu

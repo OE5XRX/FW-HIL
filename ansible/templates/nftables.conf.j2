@@ -17,7 +17,13 @@
 # there is no INPUT filtering at all, so admin ssh / management traffic is never
 # touched.
 
-flush ruleset
+# Replace ONLY our own table — never `flush ruleset`, which would wipe every
+# unrelated nftables table on the host (UFW/Docker/NAT/operator rules) on each
+# enable/refresh. The empty add before delete makes this idempotent on first
+# install (deleting a missing table would otherwise error); both run in the same
+# atomic transaction as the redefinition below.
+table inet fw_hil_egress {}
+delete table inet fw_hil_egress
 
 table inet fw_hil_egress {
     # GitHub's own published IP ranges (api.github.com/meta), materialized at
