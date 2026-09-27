@@ -65,6 +65,25 @@ table inet fw_hil_egress {
 {% endif %}
     }
 
+    # Configured DNS resolver(s) — restricts outbound port 53 so the untrusted
+    # `hil` process can't DNS-tunnel to an arbitrary external resolver. Defaults
+    # to the host's own nameservers (ansible_dns.nameservers). Tunneling *via*
+    # the legitimate recursive resolver is still possible — that is inherent to
+    # DNS and out of scope for a host firewall; the VLAN is the real control.
+    set dns_servers_v4 {
+        type ipv4_addr
+{% if egress_dns_v4 | length > 0 %}
+        elements = { {{ egress_dns_v4 | join(', ') }} }
+{% endif %}
+    }
+
+    set dns_servers_v6 {
+        type ipv6_addr
+{% if egress_dns_v6 | length > 0 %}
+        elements = { {{ egress_dns_v6 | join(', ') }} }
+{% endif %}
+    }
+
     chain input {
         type filter hook input priority filter; policy drop;
 
@@ -91,10 +110,25 @@ table inet fw_hil_egress {
         ct state established,related accept
         ct state invalid drop
 
-        # Name resolution and time sync (to any resolver/NTP, incl. the LAN
-        # router — the return traffic rides the established rule above).
+        # ICMPv6 (neighbour discovery, RS, PMTU) must egress or IPv6 — including
+        # the IPv6 GitHub allowlist below — cannot function.
+        ip6 nexthdr ipv6-icmp accept
+
+        # Name resolution: restricted to the configured resolver(s) when known,
+        # otherwise any (fresh host without gathered nameservers). Return traffic
+        # rides the established rule above.
+{% if egress_dns_servers | length > 0 %}
+        ip  daddr @dns_servers_v4 udp dport 53 accept
+        ip  daddr @dns_servers_v4 tcp dport 53 accept
+        ip6 daddr @dns_servers_v6 udp dport 53 accept
+        ip6 daddr @dns_servers_v6 tcp dport 53 accept
+{% else %}
         udp dport 53 accept
         tcp dport 53 accept
+{% endif %}
+
+        # Time sync (NTP servers rotate — pinning is impractical; NTP is a poor
+        # exfil channel and the VLAN bounds it).
         udp dport 123 accept
 
         # HTTPS/HTTP only to allowlisted destinations. Everything else — the

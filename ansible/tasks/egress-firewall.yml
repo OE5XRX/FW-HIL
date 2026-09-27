@@ -40,6 +40,11 @@
     github_egress_v4: "{{ _gh_cidrs | unique | reject('search', ':') | list }}"
     github_egress_v6: "{{ _gh_cidrs | unique | select('search', ':') | list }}"
 
+- name: Split configured DNS resolvers into IPv4/IPv6
+  ansible.builtin.set_fact:
+    egress_dns_v4: "{{ egress_dns_servers | reject('search', ':') | list }}"
+    egress_dns_v6: "{{ egress_dns_servers | select('search', ':') | list }}"
+
 - name: Deploy nftables ruleset (validated before install)
   ansible.builtin.template:
     src: nftables.conf.j2

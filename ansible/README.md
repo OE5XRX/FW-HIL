@@ -83,9 +83,11 @@ adds a **second layer on the host itself**: an nftables ruleset
 - **INPUT** — `policy drop`, but loopback, established/related, and **ssh
   (22/tcp)** are accepted *first*, so an admin ssh session cannot be locked out.
 - **OUTPUT** — `policy drop` (default-deny egress), allowing only loopback,
-  established/related, DNS (53), NTP (123), and HTTPS/HTTP **to an allowlist**.
-  Everything else — the home LAN, arbitrary internet hosts — is dropped, so PR
-  code cannot exfiltrate or phone home.
+  established/related, outbound ICMPv6 (needed for IPv6 to work), DNS (53) **to
+  the configured resolver(s)** (`egress_dns_servers`, defaults to the host's
+  nameservers — so `hil` can't DNS-tunnel to an arbitrary resolver), NTP (123),
+  and HTTPS/HTTP **to the allowlist**. Everything else — the home LAN, arbitrary
+  internet hosts — is dropped, so PR code cannot exfiltrate or phone home.
 
 The allowlist is GitHub's own published ranges, materialized at apply time from
 `https://api.github.com/meta` — only the groups a **self-hosted** runner egresses
@@ -105,8 +107,11 @@ ansible-playbook -i inventory/hosts site.yml \
   --extra-vars "egress_firewall_enabled=true"
 ```
 
-Dry-run render + validate without applying (GET to the meta API is read-only;
-the ruleset is validated with `nft -c` before it would ever be installed):
+On a real apply the rendered ruleset is validated with `nft -c` (against a temp
+file) *before* it is installed, so a syntax error fails the task rather than
+loading a broken ruleset. `--check` is a lighter dry run — it reports the diff
+but does not install `nftables` or run the `validate` command (Ansible skips
+`validate` in check mode), so it is safe to run even on a fresh host:
 
 ```sh
 ansible-playbook --check -i inventory/hosts site.yml \
@@ -116,6 +121,29 @@ ansible-playbook --check -i inventory/hosts site.yml \
 > ⚠️ **No-lockout invariant:** the ssh-allow and established rules sit *above*
 > the drop policy in the input chain. Never reorder them below `policy drop`, and
 > keep `egress_firewall_ssh_port` matching the port sshd actually listens on.
+
+The firewall import runs **last** in the play, so the *initial* enable run
+provisions (apt/pip/SDK, which need un-allowlisted CDN/PyPI endpoints) while the
+firewall is still down, then raises it — no chicken-and-egg.
+
+### Maintaining an already-firewalled host
+
+Once the firewall is live, a *full* re-run would execute the apt/pip/SDK tasks
+against un-allowlisted endpoints while the old ruleset is still active, and they
+would fail. Two maintenance paths avoid that:
+
+- **Refresh the ruleset only** (e.g. to pick up rotated GitHub ranges) — the
+  `egress-firewall` tag skips every provisioning task, and the meta fetch itself
+  targets `api.github.com`, which is allowlisted, so it works with the firewall up:
+
+  ```sh
+  ansible-playbook -i inventory/hosts site.yml \
+    --tags egress-firewall --extra-vars "egress_firewall_enabled=true"
+  ```
+
+- **Full re-provision** (packages, SDK) — run with the firewall **disabled**
+  (`egress_firewall_enabled=false`, the default) as a deliberate maintenance
+  window, then re-enable.
 
 ### Honest limitations
 
