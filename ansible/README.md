@@ -15,6 +15,7 @@ as the OE5XRX Hardware-in-the-Loop CI bench.
 | FM-Board udev rules | `/etc/udev/rules.d/99-fw-hil-board.rules` | symlink `/dev/fm-board-cdc` |
 | GitHub Actions runner | systemd `gh-actions-runner.service` | org-scoped, labels `self-hosted,hil,fm_board` |
 | `hardware-map.yaml` | `/etc/fw-hil/hardware-map.yaml` | initial template with placeholders |
+| Host egress firewall (nftables) | `/etc/nftables.conf` + `nftables.service` | **opt-in**, off by default — see below |
 
 ## Dry-run (no host required)
 
@@ -70,6 +71,65 @@ Re-running is always safe — all tasks are idempotent.
 3. Find the board serial: `lsusb -v -d 2fe3:0012 | grep iSerial`
 4. Edit `/etc/fw-hil/hardware-map.yaml` on the bench (fill in both `CHANGEME` values).
 5. Re-run the playbook (the `force: false` on hardware-map.yaml preserves your edits).
+
+## Host egress firewall (defense-in-depth)
+
+The bench runs untrusted PR code as the `hil` user in the CI job. The **primary**
+network isolation is a UniFi CI-VLAN (LAN↔CI blocked, admin→CI:22 allowed,
+CI→internet allowed) that the operator configures on the switch. This playbook
+adds a **second layer on the host itself**: an nftables ruleset
+(`templates/nftables.conf.j2`, deployed by `tasks/egress-firewall.yml`) with:
+
+- **INPUT** — `policy drop`, but loopback, established/related, and **ssh
+  (22/tcp)** are accepted *first*, so an admin ssh session cannot be locked out.
+- **OUTPUT** — `policy drop` (default-deny egress), allowing only loopback,
+  established/related, DNS (53), NTP (123), and HTTPS/HTTP **to an allowlist**.
+  Everything else — the home LAN, arbitrary internet hosts — is dropped, so PR
+  code cannot exfiltrate or phone home.
+
+The allowlist is GitHub's own published ranges, materialized at apply time from
+`https://api.github.com/meta` — only the groups a **self-hosted** runner egresses
+to (`api`/`web`/`git`/`packages`, ~110 CIDRs), plus any operator-supplied
+`egress_extra_cidrs_v4`/`_v6`. The `actions` group (GitHub-*hosted* runner IPs,
+thousands of Azure CIDRs) is deliberately excluded — the bench never egresses to
+those, and including them would broadly permit exfil to Azure.
+
+### Off by default — enable with the VLAN migration
+
+`egress_firewall_enabled` defaults to **`false`**: the firewall tasks are skipped
+entirely and the host is untouched. Turn it on *together with the VLAN cutover*
+(the box IP changes then anyway), on the same idempotent run:
+
+```sh
+ansible-playbook -i inventory/hosts site.yml \
+  --extra-vars "egress_firewall_enabled=true"
+```
+
+Dry-run render + validate without applying (GET to the meta API is read-only;
+the ruleset is validated with `nft -c` before it would ever be installed):
+
+```sh
+ansible-playbook --check -i inventory/hosts site.yml \
+  --extra-vars "egress_firewall_enabled=true"
+```
+
+> ⚠️ **No-lockout invariant:** the ssh-allow and established rules sit *above*
+> the drop policy in the input chain. Never reorder them below `policy drop`, and
+> keep `egress_firewall_ssh_port` matching the port sshd actually listens on.
+
+### Honest limitations
+
+- **CDN-hosted destinations cannot be reliably pinned.** PyPI
+  (`files.pythonhosted.org` → Fastly), `objects.githubusercontent.com`,
+  `codeload`, and the Ubuntu apt mirrors resolve to rotating CDN IPs with no
+  stable published range. They are **not** in the allowlist. If a live CI job
+  needs them, add the current CIDRs to `egress_extra_cidrs_v4`/`_v6`, or rely on
+  the fact that apt/pip provisioning happens *before* the firewall is enabled.
+  The UniFi VLAN — not this host firewall — is the authoritative egress control.
+- **The GitHub set is a snapshot.** It is refreshed each time the playbook runs;
+  GitHub rotates ranges occasionally, so a long-lived bench should be
+  re-provisioned periodically (or extend the tasks with a refresh timer) to
+  avoid the allowlist going stale and silently blocking checkout.
 
 ## Linting
 

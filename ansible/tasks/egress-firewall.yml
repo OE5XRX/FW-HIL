@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Host egress firewall (nftables) — defense-in-depth under the UniFi CI-VLAN.
+#
+# This whole file is gated on `egress_firewall_enabled` (default false), so it is
+# INERT during normal provisioning. It goes live only when the playbook is run
+# with `-e egress_firewall_enabled=true`, which is intended to happen together
+# with the UniFi VLAN migration (see ansible/README.md). Until then these tasks
+# make no change to the host.
+---
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+
+- name: Fetch GitHub published IP ranges (meta API)
+  ansible.builtin.uri:
+    url: https://api.github.com/meta
+    return_content: true
+  register: gh_meta
+  # GET is read-only; run it even under --check so the ruleset is populated
+  # during a dry-run render/validate.
+  check_mode: false
+
+- name: Compute GitHub egress allowlist (split IPv4/IPv6)
+  vars:
+    # Only the meta groups a SELF-HOSTED runner egresses to: api.github.com (api),
+    # github.com web + release/runner downloads (web), repo checkout (git), and
+    # ghcr/package pulls (packages). Deliberately EXCLUDES `actions` — those are
+    # the IP ranges of GitHub-*hosted* runners (thousands of Azure CIDRs), which
+    # our self-hosted bench never egresses to; including them would balloon the
+    # set to ~7500 entries and broadly permit exfil to Azure. `hooks` is inbound
+    # only. Result is a focused ~110-CIDR allowlist.
+    _gh_cidrs: >-
+      {{ (gh_meta.json.api | default([]))
+         + (gh_meta.json.web | default([]))
+         + (gh_meta.json.git | default([]))
+         + (gh_meta.json.packages | default([])) }}
+  ansible.builtin.set_fact:
+    github_egress_v4: "{{ _gh_cidrs | unique | reject('search', ':') | list }}"
+    github_egress_v6: "{{ _gh_cidrs | unique | select('search', ':') | list }}"
+
+- name: Deploy nftables ruleset (validated before install)
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0755"
+    # nft -c parses the rendered temp file WITHOUT applying it; a syntax error
+    # fails the task before the bad ruleset ever reaches /etc — no lockout.
+    validate: "nft -c -f %s"
+  notify: Reload nftables
+
+- name: Enable and start nftables service
+  ansible.builtin.systemd:
+    name: nftables.service
+    enabled: true
+    state: started
+  notify: Reload nftables

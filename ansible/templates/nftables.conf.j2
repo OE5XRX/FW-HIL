@@ -1,0 +1,107 @@
+#!/usr/sbin/nft -f
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# {{ ansible_managed }}
+# FW-HIL bench host egress firewall (defense-in-depth).
+#
+# Rendered by ansible/tasks/egress-firewall.yml. DO NOT edit on the host — any
+# manual change is overwritten on the next playbook run.
+#
+# Purpose: a second layer under the UniFi CI-VLAN. It denies OUTBOUND traffic by
+# default so untrusted PR code (run as the `hil` user in the CI job) cannot phone
+# home or reach the home LAN, allowing only DNS/NTP and HTTPS/HTTP to an
+# allowlist. The VLAN remains the primary LAN-isolation control; see README.
+#
+# LOCKOUT SAFETY: the input chain accepts loopback, established/related and
+# ssh (22/tcp) BEFORE the drop policy applies, so an admin ssh session survives
+# even though the default input policy is drop.
+
+flush ruleset
+
+table inet fw_hil_egress {
+    # GitHub's own published IP ranges (api.github.com/meta), materialized at
+    # apply time. Snapshot — a playbook re-run refreshes it. See README for the
+    # staleness caveat and why CDN-hosted destinations cannot live here.
+    set github_egress_v4 {
+        type ipv4_addr
+        flags interval
+{% if github_egress_v4 | length > 0 %}
+        elements = {
+            {{ github_egress_v4 | join(',\n            ') }}
+        }
+{% endif %}
+    }
+
+    set github_egress_v6 {
+        type ipv6_addr
+        flags interval
+{% if github_egress_v6 | length > 0 %}
+        elements = {
+            {{ github_egress_v6 | join(',\n            ') }}
+        }
+{% endif %}
+    }
+
+    # Operator-extensible static allowlist for destinations that have no meta
+    # API (e.g. explicit PyPI/Fastly or distro-mirror CIDRs). Set via the
+    # `egress_extra_cidrs_v4` / `_v6` playbook vars. Empty by default.
+    set extra_egress_v4 {
+        type ipv4_addr
+        flags interval
+{% if egress_extra_cidrs_v4 | length > 0 %}
+        elements = {
+            {{ egress_extra_cidrs_v4 | join(',\n            ') }}
+        }
+{% endif %}
+    }
+
+    set extra_egress_v6 {
+        type ipv6_addr
+        flags interval
+{% if egress_extra_cidrs_v6 | length > 0 %}
+        elements = {
+            {{ egress_extra_cidrs_v6 | join(',\n            ') }}
+        }
+{% endif %}
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # Admin access — MUST stay above the drop policy to avoid lockout.
+        tcp dport {{ egress_firewall_ssh_port }} accept
+
+        # Diagnostics.
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+
+        oif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # Name resolution and time sync (to any resolver/NTP, incl. the LAN
+        # router — the return traffic rides the established rule above).
+        udp dport 53 accept
+        tcp dport 53 accept
+        udp dport 123 accept
+
+        # HTTPS/HTTP only to allowlisted destinations. Everything else — the
+        # home LAN, arbitrary internet hosts — falls through to `policy drop`.
+        ip  daddr @github_egress_v4 tcp dport { 80, 443 } accept
+        ip6 daddr @github_egress_v6 tcp dport { 80, 443 } accept
+        ip  daddr @extra_egress_v4  tcp dport { 80, 443 } accept
+        ip6 daddr @extra_egress_v6  tcp dport { 80, 443 } accept
+    }
+}
