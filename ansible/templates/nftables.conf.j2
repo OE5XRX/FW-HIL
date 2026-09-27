@@ -32,6 +32,7 @@ table inet fw_hil_egress {
     set github_egress_v4 {
         type ipv4_addr
         flags interval
+        auto-merge  # GitHub/actions ranges contain overlapping CIDRs; merge them
 {% if github_egress_v4 | length > 0 %}
         elements = {
             {{ github_egress_v4 | join(',\n            ') }}
@@ -42,6 +43,7 @@ table inet fw_hil_egress {
     set github_egress_v6 {
         type ipv6_addr
         flags interval
+        auto-merge
 {% if github_egress_v6 | length > 0 %}
         elements = {
             {{ github_egress_v6 | join(',\n            ') }}
@@ -55,6 +57,7 @@ table inet fw_hil_egress {
     set extra_egress_v4 {
         type ipv4_addr
         flags interval
+        auto-merge  # tolerate overlapping operator-supplied CIDRs
 {% if egress_extra_cidrs_v4 | length > 0 %}
         elements = {
             {{ egress_extra_cidrs_v4 | join(',\n            ') }}
@@ -65,6 +68,7 @@ table inet fw_hil_egress {
     set extra_egress_v6 {
         type ipv6_addr
         flags interval
+        auto-merge
 {% if egress_extra_cidrs_v6 | length > 0 %}
         elements = {
             {{ egress_extra_cidrs_v6 | join(',\n            ') }}
@@ -112,18 +116,21 @@ table inet fw_hil_egress {
         # tunnel data out via ping to an unallowlisted host.
         icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-report, mld-listener-done, mld2-listener-report } accept
 
-        # Name resolution: restricted to the effective upstream resolver(s) when
-        # known, otherwise any (no resolvers discoverable). On systemd-resolved
-        # hil talks to the 127.0.0.53 stub over loopback (accepted above); the
-        # real upstream forwarding is done by root, which is unrestricted.
+        # Name resolution: hil may reach port 53 ONLY on the effective upstream
+        # resolver(s). On systemd-resolved hil talks to the 127.0.0.53 stub over
+        # loopback (accepted above) and root does the real forwarding, so hil
+        # needs no external DNS here. When resolvers ARE discoverable (direct
+        # resolv.conf), only those are allowed.
 {% if (egress_dns_v4 | length + egress_dns_v6 | length) > 0 %}
         ip  daddr @dns_servers_v4 udp dport 53 accept
         ip  daddr @dns_servers_v4 tcp dport 53 accept
         ip6 daddr @dns_servers_v6 udp dport 53 accept
         ip6 daddr @dns_servers_v6 tcp dport 53 accept
 {% else %}
-        udp dport 53 accept
-        tcp dport 53 accept
+        # No resolver discoverable → FAIL CLOSED: hil's external port 53 falls
+        # through to the final drop (no blanket accept — that would reopen the
+        # DNS-tunnel exfil path). Set egress_dns_servers explicitly if a direct
+        # resolver is required.
 {% endif %}
 
         # Time sync (NTP servers rotate — pinning is impractical; NTP is a poor

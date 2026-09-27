@@ -24,18 +24,26 @@
 
 - name: Compute GitHub egress allowlist (split IPv4/IPv6)
   vars:
-    # Only the meta groups a SELF-HOSTED runner egresses to: api.github.com (api),
-    # github.com web + release/runner downloads (web), repo checkout (git), and
-    # ghcr/package pulls (packages). Deliberately EXCLUDES `actions` — those are
-    # the IP ranges of GitHub-*hosted* runners (thousands of Azure CIDRs), which
-    # our self-hosted bench never egresses to; including them would balloon the
-    # set to ~7500 entries and broadly permit exfil to Azure. `hooks` is inbound
-    # only. Result is a focused ~110-CIDR allowlist.
+    # The meta groups a SELF-HOSTED runner must egress to:
+    #   api      — api.github.com
+    #   web      — github.com web + release/runner downloads
+    #   git      — repo checkout
+    #   packages — ghcr / package pulls
+    #   actions  — the Actions control plane (*.actions.githubusercontent.com,
+    #              pipelines...) the runner long-polls for jobs. REQUIRED: without
+    #              it an enabled bench can't receive jobs. This is the group
+    #              GitHub documents for IP allow lists; it is large (~7k mostly
+    #              Azure CIDRs) and correspondingly widens hil's egress to Azure —
+    #              an accepted trade-off since the VLAN is the real boundary.
+    # `hooks` (inbound) and `dependabot` (GitHub-side) are not needed here.
+    # NOTE: Azure-blob-backed artifact/log/cache uploads (*.blob.core.windows.net)
+    # are not fully covered by any meta group — see README's honest limitations.
     _gh_cidrs: >-
       {{ (gh_meta.json.api | default([]))
          + (gh_meta.json.web | default([]))
          + (gh_meta.json.git | default([]))
-         + (gh_meta.json.packages | default([])) }}
+         + (gh_meta.json.packages | default([]))
+         + (gh_meta.json.actions | default([])) }}
   ansible.builtin.set_fact:
     github_egress_v4: "{{ _gh_cidrs | unique | reject('search', ':') | list }}"
     github_egress_v6: "{{ _gh_cidrs | unique | select('search', ':') | list }}"

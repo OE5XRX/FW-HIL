@@ -112,14 +112,21 @@ default) `hil` resolves via the `127.0.0.53` stub over loopback (accepted) and
 root does the real upstream forwarding (unrestricted), so the allowlist chiefly
 matters where `hil` resolves *directly* against an external resolver; there the
 task reads the real upstreams from `/run/systemd/resolve/resolv.conf` and strips
-loopback. If no upstream is discoverable it falls back to allowing port 53 to any.
+loopback. If **no** upstream is discoverable the firewall **fails closed** —
+`hil`'s external port 53 is dropped rather than opened to any destination (which
+would reopen the DNS-tunnel path). On systemd-resolved this is fine (`hil` uses
+the loopback stub); set `egress_dns_servers` explicitly only if a bench resolves
+directly and has no discoverable resolver.
 
-The allowlist is GitHub's own published ranges, materialized at apply time from
-`https://api.github.com/meta` — only the groups a **self-hosted** runner egresses
-to (`api`/`web`/`git`/`packages`, ~110 CIDRs), plus any operator-supplied
-`egress_extra_cidrs_v4`/`_v6`. The `actions` group (GitHub-*hosted* runner IPs,
-thousands of Azure CIDRs) is deliberately excluded — the bench never egresses to
-those, and including them would broadly permit exfil to Azure.
+The HTTPS/HTTP allowlist is GitHub's own published ranges, materialized at apply
+time from `https://api.github.com/meta` — the groups a **self-hosted** runner
+must egress to: `api`/`web`/`git`/`packages` **and `actions`**, plus any
+operator-supplied `egress_extra_cidrs_v4`/`_v6`. `actions` is the Actions control
+plane (`*.actions.githubusercontent.com`) the runner long-polls for jobs — it is
+**required** (without it an enabled bench receives no jobs) and is the group
+GitHub documents for IP allow lists. It is large (~7k mostly-Azure CIDRs), so it
+widens `hil`'s egress to Azure — an accepted trade-off given the VLAN is the real
+boundary. (`hooks`/`dependabot` are not needed.)
 
 ### Off by default — enable with the VLAN migration
 
@@ -167,6 +174,12 @@ ansible-playbook -i inventory/hosts site.yml \
   needs them, add the current CIDRs to `egress_extra_cidrs_v4`/`_v6`, or rely on
   the fact that apt/pip provisioning happens *before* the firewall is enabled.
   The UniFi VLAN — not this host firewall — is the authoritative egress control.
+- **Actions artifact/log/cache uploads** go to Azure blob storage
+  (`*.blob.core.windows.net`), which is not fully covered by the `actions` meta
+  group. Job *execution* works (control plane is allowlisted), but artifact/log
+  upload from the `hil` runner may be degraded until the relevant CIDRs are added
+  to `egress_extra_cidrs_*` — the HIL gate itself uploads little, so this is
+  usually moot.
 - **The GitHub set is a snapshot.** It is refreshed each time the playbook runs;
   GitHub rotates ranges occasionally, so a long-lived bench should be
   re-provisioned periodically (or extend the tasks with a refresh timer) to
