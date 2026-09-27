@@ -304,13 +304,20 @@ class LiveAudioLoopback:
 
         playback = self.resolve_playback_device()
         capture = self.resolve_capture_device()
-        # Record a touch longer than playback to absorb loopback latency.
-        capture_s = self.tone_duration_s + max(self.settle_s, 0.5)
+        # Record a touch longer than the tone to absorb loopback latency, and pad
+        # the *played* buffer with matching trailing silence. In loopback mode the
+        # captured IN is echoed from the OUT stream, so once the tone ends the OUT
+        # (and thus the echoed IN) stops — arecord would then underrun on the tail
+        # and exit non-zero. Playing tone+silence keeps the source alive for the
+        # whole capture window; the reference used for scoring stays the tone only.
+        tail_s = max(self.settle_s, 0.5)
+        capture_s = self.tone_duration_s + tail_s
+        silence = b"\x00\x00" * (int(round(tail_s * self.sample_rate)) * self.channels)
         with tempfile.TemporaryDirectory() as tmp:
             ref_path = f"{tmp}/ref.raw"
             cap_path = f"{tmp}/cap.raw"
             with open(ref_path, "wb") as fh:
-                fh.write(float_to_s16le(reference))
+                fh.write(float_to_s16le(reference) + silence)
             rec = subprocess.Popen(self.arecord_cmd(capture, cap_path, capture_s))
             try:
                 self._sleep(0.2)  # let arecord open the device before we play
