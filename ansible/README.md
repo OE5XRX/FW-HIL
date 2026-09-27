@@ -74,29 +74,42 @@ Re-running is always safe — all tasks are idempotent.
 
 ## Host egress firewall (defense-in-depth)
 
-The bench runs untrusted PR code as the `hil` user in the CI job. The **primary**
-network isolation is a UniFi CI-VLAN (LAN↔CI blocked, admin→CI:22 allowed,
-CI→internet allowed) that the operator configures on the switch. This playbook
-adds a **second layer on the host itself**: an nftables ruleset
-(`templates/nftables.conf.j2`, deployed by `tasks/egress-firewall.yml`) with:
+The bench runs untrusted PR code as the `hil` user in the CI job.
 
-- **INPUT** — `policy drop`, but loopback, established/related, and **ssh
-  (22/tcp)** are accepted *first*, so an admin ssh session cannot be locked out.
-- **OUTPUT** — `policy drop` (default-deny egress), allowing only loopback,
-  established/related, outbound ICMPv6 **control messages** (NDP/MLD/PMTU — not
-  echo-request, so ping can't tunnel out), DNS (53) **to
-  the effective upstream resolver(s)** (so `hil` can't DNS-tunnel to an arbitrary
-  resolver), NTP (123), and HTTPS/HTTP **to the allowlist**. Everything else —
-  the home LAN, arbitrary internet hosts — is dropped, so PR code cannot
-  exfiltrate or phone home.
+**Division of labour:**
 
-  The DNS allowlist is derived from `egress_dns_servers` (default: the host's
-  `/etc/resolv.conf` nameservers). On a **systemd-resolved** host (the Ubuntu
-  default) that is just the `127.0.0.53` stub, so the task also reads the real
-  upstreams from `/run/systemd/resolve/resolv.conf` and strips loopback — without
-  this, enabling the firewall would break resolution entirely (the stub's
-  upstream forwards would be dropped). If no upstream is discoverable it falls
-  back to allowing port 53 to any.
+- **UniFi CI-VLAN (box-wide, primary)** — the operator configures the switch so
+  the whole bench is isolated: LAN↔CI blocked, admin→CI:22 allowed, CI→internet
+  allowed. This is the authoritative network control for the machine.
+- **This host firewall (`hil`-user-scoped, defense-in-depth)** — an nftables
+  ruleset (`templates/nftables.conf.j2`, deployed by `tasks/egress-firewall.yml`)
+  that fences the egress of **only the `hil` user**. Admin (`pbuchegger`), root,
+  and system services (apt, NTP, systemd-resolved, …) are **not** restricted —
+  they keep full egress. The point is to bound exactly the untrusted code, not
+  to firewall the box (the VLAN does that).
+
+The ruleset uses a single **OUTPUT** chain with `policy accept`:
+
+- Traffic **not** owned by `hil` (`meta skuid != <hil-uid>`) is accepted
+  immediately — everyone else is unaffected.
+- `hil`'s traffic is then filtered: loopback, established/related, outbound
+  ICMPv6 **control messages** (NDP/MLD/PMTU — not echo-request, so `hil` can't
+  tunnel out via ping), DNS (53) **to the effective resolver(s)**, NTP (123), and
+  HTTPS/HTTP **to the allowlist** are accepted; everything else `hil` sends — the
+  home LAN, arbitrary internet hosts — is **dropped**.
+
+There is **no INPUT or FORWARD filtering** — the table exists solely to fence
+`hil`'s egress. Because admin/ssh/management traffic is never touched, there is
+**no lockout risk** (this replaces the earlier "ssh-first, default-drop input"
+design). The `hil` UID is resolved at apply time via `getent` (not hardcoded).
+
+The DNS allowlist is derived from `egress_dns_servers` (default: the host's
+`/etc/resolv.conf` nameservers). On a **systemd-resolved** host (the Ubuntu
+default) `hil` resolves via the `127.0.0.53` stub over loopback (accepted) and
+root does the real upstream forwarding (unrestricted), so the allowlist chiefly
+matters where `hil` resolves *directly* against an external resolver; there the
+task reads the real upstreams from `/run/systemd/resolve/resolv.conf` and strips
+loopback. If no upstream is discoverable it falls back to allowing port 53 to any.
 
 The allowlist is GitHub's own published ranges, materialized at apply time from
 `https://api.github.com/meta` — only the groups a **self-hosted** runner egresses
@@ -127,32 +140,20 @@ ansible-playbook --check -i inventory/hosts site.yml \
   --extra-vars "egress_firewall_enabled=true"
 ```
 
-> ⚠️ **No-lockout invariant:** the ssh-allow and established rules sit *above*
-> the drop policy in the input chain. Never reorder them below `policy drop`, and
-> keep `egress_firewall_ssh_port` matching the port sshd actually listens on.
-
-The firewall import runs **last** in the play, so the *initial* enable run
-provisions (apt/pip/SDK, which need un-allowlisted CDN/PyPI endpoints) while the
-firewall is still down, then raises it — no chicken-and-egg.
+> ℹ️ **No lockout:** only `hil`'s egress is filtered; admin/ssh/management
+> traffic is never matched, so enabling the firewall cannot lock anyone out.
 
 ### Maintaining an already-firewalled host
 
-Once the firewall is live, a *full* re-run would execute the apt/pip/SDK tasks
-against un-allowlisted endpoints while the old ruleset is still active, and they
-would fail. Two maintenance paths avoid that:
+Provisioning tasks run as root, so once the firewall is live they are **not**
+affected by it (only `hil`'s egress is filtered). A full re-run is therefore
+safe. To refresh just the ruleset — e.g. to pick up rotated GitHub ranges — the
+`egress-firewall` tag skips every other task:
 
-- **Refresh the ruleset only** (e.g. to pick up rotated GitHub ranges) — the
-  `egress-firewall` tag skips every provisioning task, and the meta fetch itself
-  targets `api.github.com`, which is allowlisted, so it works with the firewall up:
-
-  ```sh
-  ansible-playbook -i inventory/hosts site.yml \
-    --tags egress-firewall --extra-vars "egress_firewall_enabled=true"
-  ```
-
-- **Full re-provision** (packages, SDK) — run with the firewall **disabled**
-  (`egress_firewall_enabled=false`, the default) as a deliberate maintenance
-  window, then re-enable.
+```sh
+ansible-playbook -i inventory/hosts site.yml \
+  --tags egress-firewall --extra-vars "egress_firewall_enabled=true"
+```
 
 ### Honest limitations
 

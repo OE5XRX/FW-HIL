@@ -55,11 +55,11 @@
     # ── Host egress firewall (defense-in-depth, see tasks/egress-firewall.yml) ──
     # OFF by default: the firewall tasks are skipped entirely during a normal
     # provision run, so nothing is applied to the host. Flip this to true (via
-    # --extra-vars) together with the UniFi CI-VLAN migration to activate the
-    # default-deny-outbound ruleset. The ssh-allow rule prevents lockout.
+    # --extra-vars) together with the UniFi CI-VLAN migration to activate it.
+    # The ruleset filters ONLY the `hil` runner user's egress (meta skuid);
+    # admin/root/system traffic is untouched, so there is no lockout risk.
     egress_firewall_enabled: false
-    egress_firewall_ssh_port: 22
-    # Base resolver list the bench may reach on port 53, so outbound DNS can't
+    # Base resolver list hil may reach on port 53, so its egress can't
     # tunnel to an arbitrary external resolver. Seeded from /etc/resolv.conf.
     # On a systemd-resolved host that is only the 127.0.0.53 stub, so the firewall
     # task additionally reads the REAL upstreams from

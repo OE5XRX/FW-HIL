@@ -41,11 +41,13 @@
     github_egress_v6: "{{ _gh_cidrs | unique | select('search', ':') | list }}"
 
 - name: Detect systemd-resolved upstream resolvers (if present)
-  # On a systemd-resolved host (Ubuntu default) /etc/resolv.conf — and thus
-  # ansible_dns.nameservers — is the 127.0.0.53 stub. The daemon forwards the
-  # REAL upstream queries from the host to the external resolvers, and those
-  # egress packets hit this OUTPUT chain. /run/systemd/resolve/resolv.conf holds
-  # the actual upstreams; read them so we allowlist those, not the useless stub.
+  # Only hil's egress is filtered. On a systemd-resolved host (Ubuntu default)
+  # hil resolves via the 127.0.0.53 stub over loopback (already allowed) and the
+  # real upstream forwarding is done by root (unrestricted) — so the DNS
+  # allowlist chiefly matters where hil resolves DIRECTLY against an external
+  # resolver. /etc/resolv.conf (ansible_dns.nameservers) is then the stub, so we
+  # also read the real upstreams from /run/systemd/resolve/resolv.conf and drop
+  # loopback, keeping the allowlist correct in both cases.
   ansible.builtin.slurp:
     src: /run/systemd/resolve/resolv.conf
   register: _resolved_stub
@@ -68,6 +70,17 @@
   ansible.builtin.set_fact:
     egress_dns_v4: "{{ _dns_all | reject('search', ':') | list }}"
     egress_dns_v6: "{{ _dns_all | select('search', ':') | list }}"
+
+- name: Resolve the bench user's UID (scope the firewall to hil, never hardcode)
+  # The OUTPUT filter matches `meta skuid <uid>`; the uid varies per host
+  # (currently 1001) so look it up rather than pinning it.
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ bench_user }}"
+
+- name: Set the hil UID fact for the ruleset
+  ansible.builtin.set_fact:
+    egress_hil_uid: "{{ getent_passwd[bench_user][1] }}"
 
 - name: Deploy nftables ruleset (validated before install)
   ansible.builtin.template:
