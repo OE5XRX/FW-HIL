@@ -110,9 +110,12 @@ table inet fw_hil_egress {
         ct state established,related accept
         ct state invalid drop
 
-        # ICMPv6 (neighbour discovery, RS, PMTU) must egress or IPv6 — including
-        # the IPv6 GitHub allowlist below — cannot function.
-        ip6 nexthdr ipv6-icmp accept
+        # ICMPv6: only the control-message types IPv6 needs to egress (NDP, MLD,
+        # PMTU/errors). echo-request is deliberately NOT allowed, so a
+        # raw-ICMP-capable process can't tunnel data out via ping to an
+        # unallowlisted host. (Inbound ICMPv6 stays permissive per RFC 4890 —
+        # inbound RA/NS are required for IPv6 and are not an exfil path.)
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-report, mld-listener-done, mld2-listener-report } accept
 
         # Name resolution: restricted to the effective upstream resolver(s) when
         # known (systemd-resolved stub resolved to real upstreams, loopback

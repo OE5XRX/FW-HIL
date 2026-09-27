@@ -83,7 +83,8 @@ adds a **second layer on the host itself**: an nftables ruleset
 - **INPUT** — `policy drop`, but loopback, established/related, and **ssh
   (22/tcp)** are accepted *first*, so an admin ssh session cannot be locked out.
 - **OUTPUT** — `policy drop` (default-deny egress), allowing only loopback,
-  established/related, outbound ICMPv6 (needed for IPv6 to work), DNS (53) **to
+  established/related, outbound ICMPv6 **control messages** (NDP/MLD/PMTU — not
+  echo-request, so ping can't tunnel out), DNS (53) **to
   the effective upstream resolver(s)** (so `hil` can't DNS-tunnel to an arbitrary
   resolver), NTP (123), and HTTPS/HTTP **to the allowlist**. Everything else —
   the home LAN, arbitrary internet hosts — is dropped, so PR code cannot
