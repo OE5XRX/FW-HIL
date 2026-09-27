@@ -59,10 +59,12 @@
     # default-deny-outbound ruleset. The ssh-allow rule prevents lockout.
     egress_firewall_enabled: false
     egress_firewall_ssh_port: 22
-    # Resolvers the bench may reach on port 53. Defaults to the host's own
-    # nameservers so outbound DNS can't tunnel to an arbitrary external resolver.
-    # On a systemd-resolved host this is the 127.0.0.53 stub (served over the
-    # already-allowed loopback). Empty → outbound port 53 is allowed to any.
+    # Base resolver list the bench may reach on port 53, so outbound DNS can't
+    # tunnel to an arbitrary external resolver. Seeded from /etc/resolv.conf.
+    # On a systemd-resolved host that is only the 127.0.0.53 stub, so the firewall
+    # task additionally reads the REAL upstreams from
+    # /run/systemd/resolve/resolv.conf and strips loopback (see egress-firewall.yml).
+    # If no upstream is discoverable, outbound port 53 falls back to any.
     egress_dns_servers: "{{ ansible_dns.nameservers | default([]) }}"
     # Static extra allowlist CIDRs for destinations without a meta API (e.g.
     # explicit PyPI/Fastly or distro-mirror ranges). See README for the caveat

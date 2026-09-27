@@ -114,10 +114,11 @@ table inet fw_hil_egress {
         # the IPv6 GitHub allowlist below — cannot function.
         ip6 nexthdr ipv6-icmp accept
 
-        # Name resolution: restricted to the configured resolver(s) when known,
-        # otherwise any (fresh host without gathered nameservers). Return traffic
+        # Name resolution: restricted to the effective upstream resolver(s) when
+        # known (systemd-resolved stub resolved to real upstreams, loopback
+        # stripped), otherwise any (no resolvers discoverable). Return traffic
         # rides the established rule above.
-{% if egress_dns_servers | length > 0 %}
+{% if (egress_dns_v4 | length + egress_dns_v6 | length) > 0 %}
         ip  daddr @dns_servers_v4 udp dport 53 accept
         ip  daddr @dns_servers_v4 tcp dport 53 accept
         ip6 daddr @dns_servers_v6 udp dport 53 accept

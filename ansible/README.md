@@ -84,10 +84,18 @@ adds a **second layer on the host itself**: an nftables ruleset
   (22/tcp)** are accepted *first*, so an admin ssh session cannot be locked out.
 - **OUTPUT** — `policy drop` (default-deny egress), allowing only loopback,
   established/related, outbound ICMPv6 (needed for IPv6 to work), DNS (53) **to
-  the configured resolver(s)** (`egress_dns_servers`, defaults to the host's
-  nameservers — so `hil` can't DNS-tunnel to an arbitrary resolver), NTP (123),
-  and HTTPS/HTTP **to the allowlist**. Everything else — the home LAN, arbitrary
-  internet hosts — is dropped, so PR code cannot exfiltrate or phone home.
+  the effective upstream resolver(s)** (so `hil` can't DNS-tunnel to an arbitrary
+  resolver), NTP (123), and HTTPS/HTTP **to the allowlist**. Everything else —
+  the home LAN, arbitrary internet hosts — is dropped, so PR code cannot
+  exfiltrate or phone home.
+
+  The DNS allowlist is derived from `egress_dns_servers` (default: the host's
+  `/etc/resolv.conf` nameservers). On a **systemd-resolved** host (the Ubuntu
+  default) that is just the `127.0.0.53` stub, so the task also reads the real
+  upstreams from `/run/systemd/resolve/resolv.conf` and strips loopback — without
+  this, enabling the firewall would break resolution entirely (the stub's
+  upstream forwards would be dropped). If no upstream is discoverable it falls
+  back to allowing port 53 to any.
 
 The allowlist is GitHub's own published ranges, materialized at apply time from
 `https://api.github.com/meta` — only the groups a **self-hosted** runner egresses

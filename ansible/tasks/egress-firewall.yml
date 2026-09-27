@@ -40,10 +40,34 @@
     github_egress_v4: "{{ _gh_cidrs | unique | reject('search', ':') | list }}"
     github_egress_v6: "{{ _gh_cidrs | unique | select('search', ':') | list }}"
 
-- name: Split configured DNS resolvers into IPv4/IPv6
+- name: Detect systemd-resolved upstream resolvers (if present)
+  # On a systemd-resolved host (Ubuntu default) /etc/resolv.conf — and thus
+  # ansible_dns.nameservers — is the 127.0.0.53 stub. The daemon forwards the
+  # REAL upstream queries from the host to the external resolvers, and those
+  # egress packets hit this OUTPUT chain. /run/systemd/resolve/resolv.conf holds
+  # the actual upstreams; read them so we allowlist those, not the useless stub.
+  ansible.builtin.slurp:
+    src: /run/systemd/resolve/resolv.conf
+  register: _resolved_stub
+  failed_when: false
+  check_mode: false
+
+- name: Compute effective DNS resolver allowlist (real upstreams, no loopback)
+  vars:
+    _resolved_upstreams: >-
+      {{ (_resolved_stub.content | default('') | b64decode).splitlines()
+         | select('match', '^nameserver\s')
+         | map('regex_replace', '^nameserver\s+(\S+).*$', '\1')
+         | list }}
+    # Drop loopback stubs (127.0.0.0/8, ::1): loopback egress is already allowed
+    # by `oif lo`, and keeping the stub here would mask the real upstreams and
+    # break resolution once the firewall is up.
+    _dns_all: >-
+      {{ (egress_dns_servers + _resolved_upstreams)
+         | unique | reject('match', '^(127\.|::1$)') | list }}
   ansible.builtin.set_fact:
-    egress_dns_v4: "{{ egress_dns_servers | reject('search', ':') | list }}"
-    egress_dns_v6: "{{ egress_dns_servers | select('search', ':') | list }}"
+    egress_dns_v4: "{{ _dns_all | reject('search', ':') | list }}"
+    egress_dns_v6: "{{ _dns_all | select('search', ':') | list }}"
 
 - name: Deploy nftables ruleset (validated before install)
   ansible.builtin.template:
