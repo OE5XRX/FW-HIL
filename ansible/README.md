@@ -15,6 +15,7 @@ as the OE5XRX Hardware-in-the-Loop CI bench.
 | FM-Board udev rules | `/etc/udev/rules.d/99-fw-hil-board.rules` | symlink `/dev/fm-board-cdc` |
 | GitHub Actions runner | systemd `gh-actions-runner.service` | org-scoped, labels `self-hosted,hil,fm_board` |
 | `hardware-map.yaml` | `/etc/fw-hil/hardware-map.yaml` | initial template with placeholders |
+| Host egress firewall (nftables) | `/etc/nftables.conf` + `nftables.service` | **opt-in**, off by default — see below |
 
 ## Dry-run (no host required)
 
@@ -70,6 +71,119 @@ Re-running is always safe — all tasks are idempotent.
 3. Find the board serial: `lsusb -v -d 2fe3:0012 | grep iSerial`
 4. Edit `/etc/fw-hil/hardware-map.yaml` on the bench (fill in both `CHANGEME` values).
 5. Re-run the playbook (the `force: false` on hardware-map.yaml preserves your edits).
+
+## Host egress firewall (defense-in-depth)
+
+The bench runs untrusted PR code as the `hil` user in the CI job.
+
+**Division of labour:**
+
+- **UniFi CI-VLAN (box-wide, primary)** — the operator configures the switch so
+  the whole bench is isolated: LAN↔CI blocked, admin→CI:22 allowed, CI→internet
+  allowed. This is the authoritative network control for the machine.
+- **This host firewall (`hil`-user-scoped, defense-in-depth)** — an nftables
+  ruleset (`templates/nftables.conf.j2`, deployed by `tasks/egress-firewall.yml`)
+  that fences the egress of **only the `hil` user**. Admin (`pbuchegger`), root,
+  and system services (apt, NTP, systemd-resolved, …) are **not** restricted —
+  they keep full egress. The point is to bound exactly the untrusted code, not
+  to firewall the box (the VLAN does that).
+
+The ruleset uses a single **OUTPUT** chain with `policy accept`:
+
+- Traffic **not** owned by `hil` (`meta skuid != <hil-uid>`) is accepted
+  immediately — everyone else is unaffected.
+- `hil`'s traffic is then filtered: loopback, established/related, outbound
+  ICMPv6 **control messages** (NDP/MLD/PMTU — not echo-request, so `hil` can't
+  tunnel out via ping), DNS (53) **to the effective resolver(s)**, NTP (123), and
+  HTTPS/HTTP **to the allowlist** are accepted; everything else `hil` sends — the
+  home LAN, arbitrary internet hosts — is **dropped**.
+
+There is **no INPUT or FORWARD filtering** — the table exists solely to fence
+`hil`'s egress. Because admin/ssh/management traffic is never touched, there is
+**no lockout risk** (this replaces the earlier "ssh-first, default-drop input"
+design). The `hil` UID is resolved at apply time via `getent` (not hardcoded).
+The ruleset replaces **only its own `fw_hil_egress` table** (it does not
+`flush ruleset`), so any unrelated nftables tables on the host — UFW, Docker,
+operator rules — are left intact on every enable and refresh.
+
+The DNS allowlist is derived from `egress_dns_servers` (default: the host's
+`/etc/resolv.conf` nameservers). On a **systemd-resolved** host (the Ubuntu
+default) `hil` resolves via the `127.0.0.53` stub over loopback (accepted) and
+root does the real upstream forwarding (unrestricted), so the allowlist chiefly
+matters where `hil` resolves *directly* against an external resolver; there the
+task reads the real upstreams from `/run/systemd/resolve/resolv.conf` and strips
+loopback. If **no** upstream is discoverable the firewall **fails closed** —
+`hil`'s external port 53 is dropped rather than opened to any destination (which
+would reopen the DNS-tunnel path). On systemd-resolved this is fine (`hil` uses
+the loopback stub); set `egress_dns_servers` explicitly only if a bench resolves
+directly and has no discoverable resolver.
+
+The HTTPS/HTTP allowlist is GitHub's own published ranges, materialized at apply
+time from `https://api.github.com/meta` — the groups a **self-hosted** runner
+must egress to: `api`/`web`/`git`/`packages` **and `actions`**, plus any
+operator-supplied `egress_extra_cidrs_v4`/`_v6`. `actions` is the Actions control
+plane (`*.actions.githubusercontent.com`) the runner long-polls for jobs — it is
+**required** (without it an enabled bench receives no jobs) and is the group
+GitHub documents for IP allow lists. It is large (~7k mostly-Azure CIDRs), so it
+widens `hil`'s egress to Azure — an accepted trade-off given the VLAN is the real
+boundary. (`hooks`/`dependabot` are not needed.)
+
+### Off by default — enable with the VLAN migration
+
+`egress_firewall_enabled` defaults to **`false`**: the firewall tasks are skipped
+entirely and the host is untouched. Turn it on *together with the VLAN cutover*
+(the box IP changes then anyway), on the same idempotent run:
+
+```sh
+ansible-playbook -i inventory/hosts site.yml \
+  --extra-vars "egress_firewall_enabled=true"
+```
+
+On a real apply the rendered ruleset is validated with `nft -c` (against a temp
+file) *before* it is installed, so a syntax error fails the task rather than
+loading a broken ruleset. `--check` is a lighter dry run — it reports the diff
+but does not install `nftables` or run the `validate` command (Ansible skips
+`validate` in check mode), so it is safe to run even on a fresh host:
+
+```sh
+ansible-playbook --check -i inventory/hosts site.yml \
+  --extra-vars "egress_firewall_enabled=true"
+```
+
+> ℹ️ **No lockout:** only `hil`'s egress is filtered; admin/ssh/management
+> traffic is never matched, so enabling the firewall cannot lock anyone out.
+
+### Maintaining an already-firewalled host
+
+Provisioning tasks run as root, so once the firewall is live they are **not**
+affected by it (only `hil`'s egress is filtered). A full re-run is therefore
+safe. To refresh just the ruleset — e.g. to pick up rotated GitHub ranges — the
+`egress-firewall` tag skips every other task:
+
+```sh
+ansible-playbook -i inventory/hosts site.yml \
+  --tags egress-firewall --extra-vars "egress_firewall_enabled=true"
+```
+
+### Honest limitations
+
+- **CDN-hosted destinations cannot be reliably pinned.** PyPI
+  (`files.pythonhosted.org` → Fastly), `objects.githubusercontent.com`,
+  `codeload`, and the Ubuntu apt mirrors resolve to rotating CDN IPs with no
+  stable published range. They are **not** in the allowlist. If a live CI job
+  needs them, add the current CIDRs to `egress_extra_cidrs_v4`/`_v6`, or rely on
+  the fact that apt/pip provisioning happens *before* the firewall is enabled.
+  The UniFi VLAN — not this host firewall — is the authoritative egress control.
+- **Actions artifact/log/cache uploads** go to Azure blob storage
+  (`*.blob.core.windows.net`), which is not fully covered by the `actions` meta
+  group. Job *execution* works (control plane is allowlisted), but artifact/log
+  upload from the `hil` runner may be degraded until the relevant CIDRs are added
+  to `egress_extra_cidrs_*` — the HIL gate itself uploads little, so this is
+  usually moot.
+- **The GitHub set is a snapshot.** It is refreshed each time the playbook runs;
+  GitHub rotates ranges occasionally, so a long-lived bench should be
+  re-provisioned periodically (or extend the tasks with a refresh timer) to
+  avoid the allowlist going stale and silently blocking checkout.
 
 ## Linting
 

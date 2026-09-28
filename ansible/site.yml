@@ -52,6 +52,27 @@
     register_runner: "{{ (gh_runner_token | default('')) | length > 0 }}"
     hw_map_dest: /etc/fw-hil
 
+    # ── Host egress firewall (defense-in-depth, see tasks/egress-firewall.yml) ──
+    # OFF by default: the firewall tasks are skipped entirely during a normal
+    # provision run, so nothing is applied to the host. Flip this to true (via
+    # --extra-vars) together with the UniFi CI-VLAN migration to activate it.
+    # The ruleset filters ONLY the `hil` runner user's egress (meta skuid);
+    # admin/root/system traffic is untouched, so there is no lockout risk.
+    egress_firewall_enabled: false
+    # Base resolver list hil may reach on port 53, so its egress can't
+    # tunnel to an arbitrary external resolver. Seeded from /etc/resolv.conf.
+    # On a systemd-resolved host that is only the 127.0.0.53 stub, so the firewall
+    # task additionally reads the REAL upstreams from
+    # /run/systemd/resolve/resolv.conf and strips loopback (see egress-firewall.yml).
+    # If no upstream is discoverable the firewall FAILS CLOSED — hil's external
+    # port 53 is dropped, not opened to any (loopback stub DNS still works).
+    egress_dns_servers: "{{ ansible_dns.nameservers | default([]) }}"
+    # Static extra allowlist CIDRs for destinations without a meta API (e.g.
+    # explicit PyPI/Fastly or distro-mirror ranges). See README for the caveat
+    # that CDN-hosted hosts rotate and cannot be reliably pinned here.
+    egress_extra_cidrs_v4: []
+    egress_extra_cidrs_v6: []
+
   tasks:
     # ── base system packages ──────────────────────────────────────────────────
     - name: Update apt package cache
@@ -295,6 +316,13 @@
         - Systemd daemon reload
         - Enable and start runner service
 
+    # ── host egress firewall (opt-in, see egress_firewall_enabled above) ───────
+    - name: Configure host egress firewall
+      ansible.builtin.import_tasks: tasks/egress-firewall.yml
+      when: egress_firewall_enabled | bool
+      tags:
+        - egress-firewall
+
   handlers:
     - name: Reload udev rules
       ansible.builtin.command:
@@ -319,3 +347,9 @@
         name: gh-actions-runner.service
         state: started
         enabled: true
+
+    - name: Reload nftables
+      # ExecReload of nftables.service re-applies /etc/nftables.conf atomically.
+      ansible.builtin.systemd:
+        name: nftables.service
+        state: reloaded

@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Host egress firewall (nftables) — defense-in-depth under the UniFi CI-VLAN.
+#
+# This whole file is gated on `egress_firewall_enabled` (default false), so it is
+# INERT during normal provisioning. It goes live only when the playbook is run
+# with `-e egress_firewall_enabled=true`, which is intended to happen together
+# with the UniFi VLAN migration (see ansible/README.md). Until then these tasks
+# make no change to the host.
+---
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+
+- name: Fetch GitHub published IP ranges (meta API)
+  ansible.builtin.uri:
+    url: https://api.github.com/meta
+    return_content: true
+  register: gh_meta
+  # GET is read-only; run it even under --check so the ruleset is populated
+  # during a dry-run render/validate.
+  check_mode: false
+
+- name: Compute GitHub egress allowlist (split IPv4/IPv6)
+  vars:
+    # The meta groups a SELF-HOSTED runner must egress to:
+    #   api      — api.github.com
+    #   web      — github.com web + release/runner downloads
+    #   git      — repo checkout
+    #   packages — ghcr / package pulls
+    #   actions  — the Actions control plane (*.actions.githubusercontent.com,
+    #              pipelines...) the runner long-polls for jobs. REQUIRED: without
+    #              it an enabled bench can't receive jobs. This is the group
+    #              GitHub documents for IP allow lists; it is large (~7k mostly
+    #              Azure CIDRs) and correspondingly widens hil's egress to Azure —
+    #              an accepted trade-off since the VLAN is the real boundary.
+    # `hooks` (inbound) and `dependabot` (GitHub-side) are not needed here.
+    # NOTE: Azure-blob-backed artifact/log/cache uploads (*.blob.core.windows.net)
+    # are not fully covered by any meta group — see README's honest limitations.
+    _gh_cidrs: >-
+      {{ (gh_meta.json.api | default([]))
+         + (gh_meta.json.web | default([]))
+         + (gh_meta.json.git | default([]))
+         + (gh_meta.json.packages | default([]))
+         + (gh_meta.json.actions | default([])) }}
+  ansible.builtin.set_fact:
+    github_egress_v4: "{{ _gh_cidrs | unique | reject('search', ':') | list }}"
+    github_egress_v6: "{{ _gh_cidrs | unique | select('search', ':') | list }}"
+
+- name: Detect systemd-resolved upstream resolvers (if present)
+  # Only hil's egress is filtered. On a systemd-resolved host (Ubuntu default)
+  # hil resolves via the 127.0.0.53 stub over loopback (already allowed) and the
+  # real upstream forwarding is done by root (unrestricted) — so the DNS
+  # allowlist chiefly matters where hil resolves DIRECTLY against an external
+  # resolver. /etc/resolv.conf (ansible_dns.nameservers) is then the stub, so we
+  # also read the real upstreams from /run/systemd/resolve/resolv.conf and drop
+  # loopback, keeping the allowlist correct in both cases.
+  ansible.builtin.slurp:
+    src: /run/systemd/resolve/resolv.conf
+  register: _resolved_stub
+  failed_when: false
+  check_mode: false
+
+- name: Compute effective DNS resolver allowlist (real upstreams, no loopback)
+  vars:
+    _resolved_upstreams: >-
+      {{ (_resolved_stub.content | default('') | b64decode).splitlines()
+         | select('match', '^nameserver\s')
+         | map('regex_replace', '^nameserver\s+(\S+).*$', '\1')
+         | list }}
+    # Drop loopback stubs (127.0.0.0/8, ::1): loopback egress is already allowed
+    # by `oif lo`, and keeping the stub here would mask the real upstreams and
+    # break resolution once the firewall is up.
+    _dns_all: >-
+      {{ (egress_dns_servers + _resolved_upstreams)
+         | unique | reject('match', '^(127\.|::1$)') | list }}
+  ansible.builtin.set_fact:
+    egress_dns_v4: "{{ _dns_all | reject('search', ':') | list }}"
+    egress_dns_v6: "{{ _dns_all | select('search', ':') | list }}"
+
+- name: Resolve the bench user's UID (scope the firewall to hil, never hardcode)
+  # The OUTPUT filter matches `meta skuid <uid>`; the uid varies per host
+  # (currently 1001) so look it up rather than pinning it.
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ bench_user }}"
+
+- name: Set the hil UID fact for the ruleset
+  ansible.builtin.set_fact:
+    egress_hil_uid: "{{ getent_passwd[bench_user][1] }}"
+
+- name: Deploy nftables ruleset (validated before install)
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0755"
+    # nft -c parses the rendered temp file WITHOUT applying it; a syntax error
+    # fails the task before the bad ruleset ever reaches /etc — no lockout.
+    validate: "nft -c -f %s"
+  notify: Reload nftables
+
+- name: Enable and start nftables service
+  ansible.builtin.systemd:
+    name: nftables.service
+    enabled: true
+    state: started
+  notify: Reload nftables
