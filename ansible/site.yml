@@ -38,7 +38,14 @@
     zephyr_sdk_dir: "/opt/zephyr-sdk-{{ zephyr_sdk_version }}"
     fw_hil_repo_url: "https://github.com/OE5XRX/FW-HIL.git"
     fw_hil_dir: /opt/fw-hil
-    gh_runner_version: "2.319.0"
+    # Keep at the latest actions/runner release. Because the runner is registered
+    # with --disableupdate (see the Configure task), it never self-updates, and
+    # GitHub stops queueing jobs to a self-hosted runner that has been below the
+    # current version for ~30 days. So this pin IS the update mechanism: bump it
+    # to the newest release (https://github.com/actions/runner/releases) and
+    # re-run the playbook at least monthly — the version-stamped extraction picks
+    # up the new archive and the runner service is restarted onto it.
+    gh_runner_version: "2.337.0"
     gh_runner_dir: /opt/actions-runner
     gh_runner_org_url: "https://github.com/OE5XRX"
     gh_runner_labels: "self-hosted,hil,fm_board"
@@ -278,19 +285,29 @@
       register: runner_unit
       when: register_runner
 
-    - name: Stop the runner before (re-)provisioning an un-hardened bench
-      # Only on the one migration/first-provision pass (marker absent) and only
-      # if the service already exists. Closes the window Copilot flagged: while
-      # config.sh needs the tree bench-writable, a running runner could let
-      # fork-PR code unlink/replace root-owned files that then get blessed as
-      # root-owned. The "Restart runner service" handler brings it back up.
+    - name: Check whether the pinned runner version is already installed
+      ansible.builtin.stat:
+        path: "{{ gh_runner_dir }}/.installed-runner-{{ gh_runner_version }}"
+      register: runner_versioned
+      when: register_runner
+
+    - name: Stop the runner before mutating its tree
+      # Stop the live listener before anything rewrites the runner tree, so it
+      # cannot spawn a worker from a half-replaced install. Two cases mutate the
+      # tree and are guarded here (only if the service already exists):
+      #   * un-hardened pass (marker absent) — config.sh needs the tree
+      #     bench-writable, a running runner could let fork-PR code race the
+      #     ownership change;
+      #   * version bump (per-version stamp absent) — the extraction below
+      #     overwrites the binaries in place.
+      # The "Restart runner service" handler brings it back up at the end.
       ansible.builtin.systemd:
         name: gh-actions-runner.service
         state: stopped
       when:
         - register_runner
-        - not runner_provisioned.stat.exists
         - runner_unit.stat.exists
+        - not runner_provisioned.stat.exists or not runner_versioned.stat.exists
 
     - name: Create runner directory
       # Bench-owned ONLY on the first/migration pass so config.sh can write its
@@ -317,12 +334,19 @@
       # `run.sh` guard would make a `gh_runner_version` bump re-download but
       # never re-extract — leaving no upgrade path at all. A version-stamped
       # guard re-extracts (over the top; state files below survive) whenever the
-      # pinned version changes. Extracted as root, so the binaries are root-owned.
+      # pinned version changes.
+      # --no-same-owner: as root, tar would otherwise restore the archive's
+      # build UID/GID, so the files would NOT be root-owned. Forcing them to the
+      # extracting user (root) makes the binaries root-owned on EVERY extraction
+      # — including version-bump upgrades, which skip the recursive hardening
+      # below (marker already present) and so rely on this for the boundary.
       ansible.builtin.unarchive:
         src: "/tmp/actions-runner-{{ gh_runner_version }}.tar.gz"
         dest: "{{ gh_runner_dir }}"
         remote_src: true
         creates: "{{ gh_runner_dir }}/.installed-runner-{{ gh_runner_version }}"
+        extra_opts:
+          - --no-same-owner
       when: register_runner
       register: runner_extracted
       notify: Restart runner service
