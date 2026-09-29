@@ -163,6 +163,100 @@ def test_explicit_devices_skip_resolution():
     assert lb.resolve_capture_device() == "hw:9,0"
 
 
+# ── play/capture windowing + ordering (loopback vs record-first) ──────────────
+def test_loopback_mode_default_on():
+    # This backend IS the firmware-loopback backend: aplay-first ordering (OUT
+    # flowing before capture opens) is the default so arecord never starves.
+    assert LiveAudioLoopback().loopback_mode is True
+
+
+def test_play_capture_plan_loopback_brackets_tone_with_silence():
+    lb = LiveAudioLoopback(tone_duration_s=1.0, settle_s=0.5, prime_s=0.2)
+    plan = lb.play_capture_plan()
+    # loopback: leading silence primes OUT before arecord opens ...
+    assert plan["lead_s"] == 0.5
+    # ... capture_s is the requested tone + tail floor (arecord rounds it up) ...
+    assert plan["capture_s"] == 1.5
+    # ... and trailing silence is grown to outlast the *rounded* capture:
+    # prime(0.2) + ceil(1.5)=2 + guard(0.1) = 2.3 total played, minus lead(0.5)
+    # and tone(1.0) -> 0.8 s tail (> the 0.5 s floor).
+    assert plan["tail_s"] == pytest.approx(0.8)
+
+
+def test_play_capture_plan_covers_rounded_capture():
+    # The invariant that prevents the tail underrun: the whole played buffer must
+    # outlast the priming head-start plus the *rounded-up* arecord duration.
+    import math
+
+    for tone_s, settle_s in [(1.0, 0.5), (0.25, 0.5), (2.0, 0.3), (0.1, 0.0)]:
+        lb = LiveAudioLoopback(tone_duration_s=tone_s, settle_s=settle_s, prime_s=0.2)
+        plan = lb.play_capture_plan()
+        played_total = plan["lead_s"] + tone_s + plan["tail_s"]
+        rec_seconds = math.ceil(plan["capture_s"])
+        assert played_total >= lb.prime_s + rec_seconds
+
+
+def test_play_capture_plan_record_first_has_no_lead():
+    # Real RX: arecord opens first, its own pre-roll brackets the tone, so no
+    # leading silence is played and no rounded-tail growth is needed (the source
+    # is the radio, not OUT).
+    lb = LiveAudioLoopback(loopback_mode=False, tone_duration_s=1.0, settle_s=0.5)
+    plan = lb.play_capture_plan()
+    assert plan["lead_s"] == 0.0
+    assert plan["tail_s"] == 0.5
+    assert plan["capture_s"] == 1.5
+
+
+def test_play_capture_plan_tail_floor():
+    # Record-first with a tiny settle still yields a 0.5 s tail floor so the
+    # capture window always absorbs loopback latency.
+    lb = LiveAudioLoopback(loopback_mode=False, settle_s=0.0)
+    assert lb.play_capture_plan()["tail_s"] == 0.5
+
+
+def test_build_played_bytes_loopback_lengths():
+    # tone + leading + trailing silence, all S16 mono @ 8000 Hz.
+    lb = LiveAudioLoopback(sample_rate=8000, channels=1)
+    ref = generate_sine(1000.0, 0.5, sample_rate=8000)  # 4000 samples
+    raw = lb.build_played_bytes(ref, lead_s=0.25, tail_s=0.5)
+    lead = int(round(0.25 * 8000))
+    tail = int(round(0.5 * 8000))
+    assert len(raw) == (lead + ref.size + tail) * 2  # 2 bytes/sample
+    # leads with silence and ends with silence
+    assert raw[: lead * 2] == b"\x00\x00" * lead
+    assert raw[-tail * 2 :] == b"\x00\x00" * tail
+
+
+def test_build_played_bytes_no_silence_is_bare_tone():
+    lb = LiveAudioLoopback()
+    ref = generate_sine(1000.0, 0.1)
+    assert lb.build_played_bytes(ref, lead_s=0.0, tail_s=0.0) == float_to_s16le(ref)
+
+
+def test_loopback_capture_raises_on_aplay_failure(monkeypatch):
+    # In loopback aplay runs in the background; a non-zero exit means OUT never
+    # played, so the capture is meaningless and must surface as an I/O failure
+    # rather than being scored (regression guard for the discarded exit status).
+    import fw_hil.audio_live as al
+
+    class _FailingPlay:
+        def wait(self):
+            return 1  # aplay failed
+
+    class _RecOk:
+        returncode = 0  # arecord "succeeds"
+
+    monkeypatch.setattr(al.subprocess, "Popen", lambda argv: _FailingPlay())
+    lb = LiveAudioLoopback(
+        playback_device="hw:9,0",
+        capture_device="hw:9,0",
+        run=lambda *a, **k: _RecOk(),
+    )
+    lb._sleep = lambda _s: None
+    with pytest.raises(RuntimeError, match="aplay exited with status 1"):
+        lb._alsa_play_capture(generate_sine(1000.0, 0.05))
+
+
 # ── orchestration with injected fakes ─────────────────────────────────────────
 class _Recorder:
     def __init__(self, capture_fn):

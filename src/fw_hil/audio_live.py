@@ -97,10 +97,12 @@ def s16le_to_float(raw: bytes):
 def align_capture(reference, captured, sample_rate=8000):
     """Locate the played tone in ``captured``; return ``(lag, window)``.
 
-    ``arecord`` is started before ``aplay`` and stopped after it, so a real
-    capture brackets the played tone with pre/post-roll silence. Handed straight
-    to :func:`analyze_loopback`, that silence is scored as dropouts across the
-    full buffer and even a clean board exceeds the dropout limit. We use the
+    The capture brackets the played tone with pre/post-roll silence — leading
+    silence from the priming/settle before the tone plays, trailing silence from
+    the tail the capture window keeps open (see
+    :meth:`LiveAudioLoopback.play_capture_plan`). Handed straight to
+    :func:`analyze_loopback`, that silence is scored as dropouts across the full
+    buffer and even a clean board exceeds the dropout limit. We use the
     cross-correlation lag to slice out just the played window before scoring.
 
     ``lag`` is the samples from capture start to the tone onset — i.e. the real
@@ -147,6 +149,8 @@ class LiveAudioLoopback:
         aplay: str = "aplay",
         arecord: str = "arecord",
         settle_s: float = 0.5,
+        loopback_mode: bool = True,
+        prime_s: float = 0.2,
         baudrate: int = 115200,
         run=subprocess.run,
         send_command=None,
@@ -176,6 +180,15 @@ class LiveAudioLoopback:
         self.aplay = aplay
         self.arecord = arecord
         self.settle_s = settle_s
+        # loopback_mode drives play/capture ordering (see _alsa_play_capture):
+        # in the firmware loopback the captured IN stream is fed *only* from the
+        # played OUT stream, so OUT must be flowing before arecord opens. False
+        # selects the classic record-first path for a real RX capture.
+        self.loopback_mode = loopback_mode
+        # prime_s: the gap between starting the first stream and the second, so
+        # the first device is open (and, in loopback, OUT is flowing) before the
+        # second one starts.
+        self.prime_s = prime_s
         self.baudrate = baudrate
         self._run = run
         self._send_command = send_command
@@ -224,6 +237,55 @@ class LiveAudioLoopback:
             str(math.ceil(duration_s)),
             raw_path,
         ]
+
+    # ── play/capture windowing (pure; unit-tested) ───────────────────────────
+    def _silence_bytes(self, seconds: float) -> bytes:
+        """Return ``seconds`` of S16_LE silence for the configured rate/channels."""
+        n = int(round(max(seconds, 0.0) * self.sample_rate)) * self.channels
+        return b"\x00\x00" * n
+
+    def play_capture_plan(self) -> dict:
+        """Compute the play/capture windows for one loopback measurement.
+
+        Returns ``lead_s`` (leading silence before the tone), ``tail_s``
+        (trailing silence after it) and ``capture_s`` (arecord duration).
+
+        In firmware-loopback mode the captured IN is echoed from the played OUT,
+        so two failure modes bracket the tone:
+
+        - **starvation at open** — if arecord opens before any OUT is flowing it
+          reads from a dead source and ALSA fails the stream with ``-EIO``. We
+          play *leading* silence and start aplay first (see _alsa_play_capture)
+          so OUT is already flowing when arecord opens.
+        - **tail underrun** — once the tone ends OUT (and thus the echoed IN)
+          stops; if arecord is still recording it underruns and exits non-zero.
+          We play *trailing* silence and clamp ``capture_s`` to the tone plus
+          that tail, so arecord always stops while OUT is still flowing.
+
+        The record-first path (real RX, ``loopback_mode=False``) needs no leading
+        silence — arecord opens first and its own pre-roll brackets the tone —
+        and its source is the radio, not OUT, so it cannot tail-underrun.
+        """
+        tail_floor = max(self.settle_s, 0.5)
+        lead_s = tail_floor if self.loopback_mode else 0.0
+        capture_s = self.tone_duration_s + tail_floor
+        if not self.loopback_mode:
+            return {"lead_s": lead_s, "tail_s": tail_floor, "capture_s": capture_s}
+        # arecord -d rounds the duration UP to whole seconds (see arecord_cmd),
+        # so the capture actually runs ceil(capture_s). In loopback the captured
+        # IN is echoed from OUT and aplay leads arecord by prime_s, so the played
+        # buffer must outlast prime_s + ceil(capture_s) — otherwise the rounded-up
+        # tail records past the point OUT stops and underruns. Grow the trailing
+        # silence to cover the rounded capture plus a small scheduling guard.
+        rec_seconds = math.ceil(capture_s)
+        guard_s = 0.1
+        min_total_s = self.prime_s + rec_seconds + guard_s
+        tail_s = max(tail_floor, min_total_s - lead_s - self.tone_duration_s)
+        return {"lead_s": lead_s, "tail_s": tail_s, "capture_s": capture_s}
+
+    def build_played_bytes(self, reference, lead_s: float, tail_s: float) -> bytes:
+        """Serialise ``reference`` bracketed by ``lead_s``/``tail_s`` of silence."""
+        return self._silence_bytes(lead_s) + float_to_s16le(reference) + self._silence_bytes(tail_s)
 
     # ── device resolution (pure logic; live listing is HW-only) ──────────────
     def resolve_playback_device(self) -> str:
@@ -296,34 +358,55 @@ class LiveAudioLoopback:
     def _alsa_play_capture(self, reference):
         """Play ``reference`` while recording the loopback; return captured floats.
 
-        Starts ``arecord`` first, then ``aplay``, so recording is already live
-        when playback begins. Uses temp raw S16_LE files and the argv builders
-        above; ALSA/subprocess-only, never exercised in host CI.
+        Ordering is mode-dependent (see :meth:`play_capture_plan`). In
+        firmware-loopback mode aplay is started *first* and primed through
+        leading silence so OUT is already flowing when arecord opens — recording
+        the tone into a live source; starting arecord first would starve it at
+        t=0 and ALSA fails the capture with ``-EIO``. In record-first mode (real
+        RX) arecord opens first, exactly as a physical capture would. The played
+        buffer is always bracketed with trailing silence and the capture window
+        clamped so arecord stops while OUT is still flowing (no tail underrun);
+        the reference used for scoring stays the tone only. Uses temp raw S16_LE
+        files and the argv builders above; ALSA/subprocess-only, never exercised
+        in host CI.
         """
         import tempfile
 
         playback = self.resolve_playback_device()
         capture = self.resolve_capture_device()
-        # Record a touch longer than the tone to absorb loopback latency, and pad
-        # the *played* buffer with matching trailing silence. In loopback mode the
-        # captured IN is echoed from the OUT stream, so once the tone ends the OUT
-        # (and thus the echoed IN) stops — arecord would then underrun on the tail
-        # and exit non-zero. Playing tone+silence keeps the source alive for the
-        # whole capture window; the reference used for scoring stays the tone only.
-        tail_s = max(self.settle_s, 0.5)
-        capture_s = self.tone_duration_s + tail_s
-        silence = b"\x00\x00" * (int(round(tail_s * self.sample_rate)) * self.channels)
+        plan = self.play_capture_plan()
+        played = self.build_played_bytes(reference, plan["lead_s"], plan["tail_s"])
         with tempfile.TemporaryDirectory() as tmp:
             ref_path = f"{tmp}/ref.raw"
             cap_path = f"{tmp}/cap.raw"
             with open(ref_path, "wb") as fh:
-                fh.write(float_to_s16le(reference) + silence)
-            rec = subprocess.Popen(self.arecord_cmd(capture, cap_path, capture_s))
-            try:
-                self._sleep(0.2)  # let arecord open the device before we play
-                self._run(self.aplay_cmd(playback, ref_path), check=True)
-            finally:
-                rc = rec.wait()
+                fh.write(played)
+            rec_argv = self.arecord_cmd(capture, cap_path, plan["capture_s"])
+            play_argv = self.aplay_cmd(playback, ref_path)
+            play_rc = 0
+            if self.loopback_mode:
+                # aplay first: prime OUT through the leading silence, then record
+                # the tone into a source that is already flowing.
+                play = subprocess.Popen(play_argv)
+                try:
+                    self._sleep(self.prime_s)  # OUT flowing before capture opens
+                    rc = self._run(rec_argv, check=False).returncode
+                finally:
+                    play_rc = play.wait()
+            else:
+                # record first: arecord live before playback begins (real RX).
+                rec = subprocess.Popen(rec_argv)
+                try:
+                    self._sleep(self.prime_s)  # let arecord open before we play
+                    self._run(play_argv, check=True)
+                finally:
+                    rc = rec.wait()
+            # A non-zero aplay exit means OUT never really played — in loopback
+            # that starves the echoed IN, so the capture is meaningless. Surface
+            # it as an I/O failure rather than scoring garbage. (The record-first
+            # path plays via check=True, which already raises.)
+            if play_rc != 0:
+                raise RuntimeError(f"aplay exited with status {play_rc}")
             # Don't score a capture that never happened: a non-zero arecord exit
             # means the recording failed (device busy, wrong format, …) and
             # cap_path is empty/garbage, so surface it instead of a bogus result.
