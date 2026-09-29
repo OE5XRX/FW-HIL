@@ -163,6 +163,61 @@ def test_explicit_devices_skip_resolution():
     assert lb.resolve_capture_device() == "hw:9,0"
 
 
+# ── play/capture windowing + ordering (loopback vs record-first) ──────────────
+def test_loopback_mode_default_on():
+    # This backend IS the firmware-loopback backend: aplay-first ordering (OUT
+    # flowing before capture opens) is the default so arecord never starves.
+    assert LiveAudioLoopback().loopback_mode is True
+
+
+def test_play_capture_plan_loopback_brackets_tone_with_silence():
+    lb = LiveAudioLoopback(tone_duration_s=1.0, settle_s=0.5)
+    plan = lb.play_capture_plan()
+    # loopback: leading silence primes OUT before arecord opens ...
+    assert plan["lead_s"] == 0.5
+    # ... trailing silence keeps OUT alive for the capture tail ...
+    assert plan["tail_s"] == 0.5
+    # ... and the capture is clamped to tone + tail so arecord stops while OUT
+    # is still flowing (no tail underrun).
+    assert plan["capture_s"] == 1.5
+
+
+def test_play_capture_plan_record_first_has_no_lead():
+    # Real RX: arecord opens first, its own pre-roll brackets the tone, so no
+    # leading silence is played.
+    lb = LiveAudioLoopback(loopback_mode=False, tone_duration_s=1.0, settle_s=0.5)
+    plan = lb.play_capture_plan()
+    assert plan["lead_s"] == 0.0
+    assert plan["tail_s"] == 0.5
+    assert plan["capture_s"] == 1.5
+
+
+def test_play_capture_plan_tail_floor():
+    # A tiny settle still yields a 0.5 s tail floor so the capture window always
+    # absorbs loopback latency.
+    lb = LiveAudioLoopback(settle_s=0.0)
+    assert lb.play_capture_plan()["tail_s"] == 0.5
+
+
+def test_build_played_bytes_loopback_lengths():
+    # tone + leading + trailing silence, all S16 mono @ 8000 Hz.
+    lb = LiveAudioLoopback(sample_rate=8000, channels=1)
+    ref = generate_sine(1000.0, 0.5, sample_rate=8000)  # 4000 samples
+    raw = lb.build_played_bytes(ref, lead_s=0.25, tail_s=0.5)
+    lead = int(round(0.25 * 8000))
+    tail = int(round(0.5 * 8000))
+    assert len(raw) == (lead + ref.size + tail) * 2  # 2 bytes/sample
+    # leads with silence and ends with silence
+    assert raw[: lead * 2] == b"\x00\x00" * lead
+    assert raw[-tail * 2 :] == b"\x00\x00" * tail
+
+
+def test_build_played_bytes_no_silence_is_bare_tone():
+    lb = LiveAudioLoopback()
+    ref = generate_sine(1000.0, 0.1)
+    assert lb.build_played_bytes(ref, lead_s=0.0, tail_s=0.0) == float_to_s16le(ref)
+
+
 # ── orchestration with injected fakes ─────────────────────────────────────────
 class _Recorder:
     def __init__(self, capture_fn):

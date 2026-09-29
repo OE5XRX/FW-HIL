@@ -123,12 +123,15 @@
         create_home: true
         state: present
 
-    - name: Add runner user to USB and serial access groups
+    - name: Add runner user to USB, serial and audio access groups
       ansible.builtin.user:
         name: "{{ bench_user }}"
         groups:
           - plugdev
           - dialout
+          # audio: the UAC2 loopback gate drives the board's ALSA devices
+          # (aplay/arecord); without membership the runner cannot open them.
+          - audio
         append: true
 
     # ── Python virtual environment ────────────────────────────────────────────
@@ -273,12 +276,27 @@
         creates: "{{ gh_runner_dir }}/run.sh"
       when: register_runner
 
-    - name: Set runner directory ownership
+    - name: Hand runner job/diag directories to the bench user
+      # Deliberately NOT a recursive chown of the whole runner tree. The runner
+      # executes untrusted fork-PR code as the bench user; if that user owned the
+      # runner application files it could overwrite root-owned config —
+      # especially `.env` and any `ACTIONS_RUNNER_HOOK_JOB_*` cleanup-hook
+      # drop-in — and persist across jobs. The unpacked binaries stay root-owned
+      # (from the root-run unarchive above); the bench user only owns the two
+      # directories the runner actually writes at job time: `_work` (job
+      # workspace / checkouts) and `_diag` (runner logs). The runner's own state
+      # files (.runner/.credentials/.env/.path) live in the top-level dir, which
+      # is bench-user-owned from "Create runner directory", so config.sh can
+      # still write them.
       ansible.builtin.file:
-        path: "{{ gh_runner_dir }}"
+        path: "{{ gh_runner_dir }}/{{ item }}"
+        state: directory
         owner: "{{ bench_user }}"
         group: "{{ bench_user }}"
-        recurse: true
+        mode: "0755"
+      loop:
+        - _work
+        - _diag
       when: register_runner
 
     - name: Check if runner is already configured
@@ -288,6 +306,12 @@
       when: register_runner
 
     - name: Configure GitHub Actions runner
+      # --disableupdate: the runner binaries are root-owned (see the job/diag
+      # ownership task above), so a self-update run as the bench user could not
+      # replace them anyway. The version is pinned in `gh_runner_version` and
+      # bumped by re-running this (idempotent) playbook, so disabling the
+      # in-place auto-update avoids a failing update loop rather than losing
+      # anything.
       ansible.builtin.command:
         cmd: >-
           ./config.sh
@@ -297,6 +321,7 @@
           --name "{{ ansible_hostname }}"
           --labels "{{ gh_runner_labels }}"
           --runnergroup "Default"
+          --disableupdate
         chdir: "{{ gh_runner_dir }}"
       become: true
       become_user: "{{ bench_user }}"
