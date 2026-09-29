@@ -263,11 +263,24 @@ class LiveAudioLoopback:
           that tail, so arecord always stops while OUT is still flowing.
 
         The record-first path (real RX, ``loopback_mode=False``) needs no leading
-        silence — arecord opens first and its own pre-roll brackets the tone.
+        silence — arecord opens first and its own pre-roll brackets the tone —
+        and its source is the radio, not OUT, so it cannot tail-underrun.
         """
-        tail_s = max(self.settle_s, 0.5)
-        lead_s = tail_s if self.loopback_mode else 0.0
-        capture_s = self.tone_duration_s + tail_s
+        tail_floor = max(self.settle_s, 0.5)
+        lead_s = tail_floor if self.loopback_mode else 0.0
+        capture_s = self.tone_duration_s + tail_floor
+        if not self.loopback_mode:
+            return {"lead_s": lead_s, "tail_s": tail_floor, "capture_s": capture_s}
+        # arecord -d rounds the duration UP to whole seconds (see arecord_cmd),
+        # so the capture actually runs ceil(capture_s). In loopback the captured
+        # IN is echoed from OUT and aplay leads arecord by prime_s, so the played
+        # buffer must outlast prime_s + ceil(capture_s) — otherwise the rounded-up
+        # tail records past the point OUT stops and underruns. Grow the trailing
+        # silence to cover the rounded capture plus a small scheduling guard.
+        rec_seconds = math.ceil(capture_s)
+        guard_s = 0.1
+        min_total_s = self.prime_s + rec_seconds + guard_s
+        tail_s = max(tail_floor, min_total_s - lead_s - self.tone_duration_s)
         return {"lead_s": lead_s, "tail_s": tail_s, "capture_s": capture_s}
 
     def build_played_bytes(self, reference, lead_s: float, tail_s: float) -> bytes:
@@ -370,6 +383,7 @@ class LiveAudioLoopback:
                 fh.write(played)
             rec_argv = self.arecord_cmd(capture, cap_path, plan["capture_s"])
             play_argv = self.aplay_cmd(playback, ref_path)
+            play_rc = 0
             if self.loopback_mode:
                 # aplay first: prime OUT through the leading silence, then record
                 # the tone into a source that is already flowing.
@@ -378,7 +392,7 @@ class LiveAudioLoopback:
                     self._sleep(self.prime_s)  # OUT flowing before capture opens
                     rc = self._run(rec_argv, check=False).returncode
                 finally:
-                    play.wait()
+                    play_rc = play.wait()
             else:
                 # record first: arecord live before playback begins (real RX).
                 rec = subprocess.Popen(rec_argv)
@@ -387,6 +401,12 @@ class LiveAudioLoopback:
                     self._run(play_argv, check=True)
                 finally:
                     rc = rec.wait()
+            # A non-zero aplay exit means OUT never really played — in loopback
+            # that starves the echoed IN, so the capture is meaningless. Surface
+            # it as an I/O failure rather than scoring garbage. (The record-first
+            # path plays via check=True, which already raises.)
+            if play_rc != 0:
+                raise RuntimeError(f"aplay exited with status {play_rc}")
             # Don't score a capture that never happened: a non-zero arecord exit
             # means the recording failed (device busy, wrong format, …) and
             # cap_path is empty/garbage, so surface it instead of a bogus result.

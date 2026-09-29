@@ -133,6 +133,11 @@
           # (aplay/arecord); without membership the runner cannot open them.
           - audio
         append: true
+      # Supplementary groups are read at process start, so an already-running
+      # runner keeps its old set until restarted — without this it would still
+      # be denied ALSA access after an `audio` add. The handler restarts it only
+      # when the runner is actually managed on this host (register_runner).
+      notify: Restart runner service
 
     # ── Python virtual environment ────────────────────────────────────────────
     - name: Create Python venv for HIL tools
@@ -269,35 +274,32 @@
       when: register_runner
 
     - name: Extract GitHub Actions runner
+      # Gate on a per-version stamp, NOT on run.sh: with self-update disabled
+      # (see the config task) run.sh always exists after the first install, so a
+      # `run.sh` guard would make a `gh_runner_version` bump re-download but
+      # never re-extract — leaving no upgrade path at all. A version-stamped
+      # guard re-extracts (over the top; state files below survive) whenever the
+      # pinned version changes. Extracted as root, so the binaries are root-owned.
       ansible.builtin.unarchive:
         src: "/tmp/actions-runner-{{ gh_runner_version }}.tar.gz"
         dest: "{{ gh_runner_dir }}"
         remote_src: true
-        creates: "{{ gh_runner_dir }}/run.sh"
+        creates: "{{ gh_runner_dir }}/.installed-runner-{{ gh_runner_version }}"
       when: register_runner
+      register: runner_extracted
+      notify: Restart runner service
 
-    - name: Hand runner job/diag directories to the bench user
-      # Deliberately NOT a recursive chown of the whole runner tree. The runner
-      # executes untrusted fork-PR code as the bench user; if that user owned the
-      # runner application files it could overwrite root-owned config —
-      # especially `.env` and any `ACTIONS_RUNNER_HOOK_JOB_*` cleanup-hook
-      # drop-in — and persist across jobs. The unpacked binaries stay root-owned
-      # (from the root-run unarchive above); the bench user only owns the two
-      # directories the runner actually writes at job time: `_work` (job
-      # workspace / checkouts) and `_diag` (runner logs). The runner's own state
-      # files (.runner/.credentials/.env/.path) live in the top-level dir, which
-      # is bench-user-owned from "Create runner directory", so config.sh can
-      # still write them.
+    - name: Stamp the installed runner version
+      # Marks this version as installed so the extraction above is idempotent and
+      # a version bump re-triggers it. The runner tarball has no such file, so we
+      # write it after a successful extract.
       ansible.builtin.file:
-        path: "{{ gh_runner_dir }}/{{ item }}"
-        state: directory
-        owner: "{{ bench_user }}"
-        group: "{{ bench_user }}"
-        mode: "0755"
-      loop:
-        - _work
-        - _diag
-      when: register_runner
+        path: "{{ gh_runner_dir }}/.installed-runner-{{ gh_runner_version }}"
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+      when: register_runner and runner_extracted is changed
 
     - name: Check if runner is already configured
       ansible.builtin.stat:
@@ -306,12 +308,15 @@
       when: register_runner
 
     - name: Configure GitHub Actions runner
-      # --disableupdate: the runner binaries are root-owned (see the job/diag
-      # ownership task above), so a self-update run as the bench user could not
-      # replace them anyway. The version is pinned in `gh_runner_version` and
-      # bumped by re-running this (idempotent) playbook, so disabling the
-      # in-place auto-update avoids a failing update loop rather than losing
-      # anything.
+      # Runs as the bench user so config.sh can write its state files
+      # (.runner/.credentials/.env/.path) into the still-user-owned directory;
+      # the ownership hardening below locks the tree down afterwards.
+      # --disableupdate: the runner binaries end up root-owned (hardening task
+      # below), so a self-update run as the bench user could not replace them
+      # anyway. The version is pinned in `gh_runner_version` and bumped by
+      # re-running this (idempotent) playbook, which re-extracts (see above), so
+      # disabling the in-place auto-update avoids a failing update loop rather
+      # than losing the upgrade path.
       ansible.builtin.command:
         cmd: >-
           ./config.sh
@@ -328,6 +333,38 @@
       when: register_runner and not runner_configured.stat.exists
       changed_when: register_runner and not runner_configured.stat.exists
       no_log: true
+
+    - name: Root-own the runner application and config (least privilege)
+      # The runner executes untrusted fork-PR code AS the bench user. Once
+      # registration has written its state files, root-own the whole tree so the
+      # bench user cannot modify — or, since it would no longer own the parent
+      # dir, unlink/replace — the runner binaries, the registration state, `.env`
+      # or an `ACTIONS_RUNNER_HOOK_JOB_*` cleanup-hook drop-in. The bench user is
+      # then handed back ONLY the runtime job/diag dirs below. With self-update
+      # disabled the runner reads (never writes) the top-level at runtime, so it
+      # runs fine root-owned. Follows GitHub's self-hosted-runner hardening guide.
+      ansible.builtin.file:
+        path: "{{ gh_runner_dir }}"
+        owner: root
+        group: root
+        recurse: true
+      when: register_runner
+
+    - name: Hand the runner job/diag directories back to the bench user
+      # `_work` (job workspace / checkouts) and `_diag` (runner logs) are the only
+      # paths the runner writes at job time; they must be bench-user-writable.
+      # Everything else stays root-owned by the task above.
+      ansible.builtin.file:
+        path: "{{ gh_runner_dir }}/{{ item }}"
+        state: directory
+        owner: "{{ bench_user }}"
+        group: "{{ bench_user }}"
+        recurse: true
+        mode: "0755"
+      loop:
+        - _work
+        - _diag
+      when: register_runner
 
     - name: Deploy runner systemd service unit
       ansible.builtin.template:
@@ -372,6 +409,17 @@
         name: gh-actions-runner.service
         state: started
         enabled: true
+
+    - name: Restart runner service
+      # Defined AFTER "Enable and start" so on a first install the unit is
+      # daemon-reloaded and started before this runs. Guarded by register_runner
+      # so it is skipped on a no-token provision (where the service does not
+      # exist). Picks up new supplementary groups (e.g. audio) and upgraded
+      # runner binaries.
+      ansible.builtin.systemd:
+        name: gh-actions-runner.service
+        state: restarted
+      when: register_runner
 
     - name: Reload nftables
       # ExecReload of nftables.service re-applies /etc/nftables.conf atomically.
