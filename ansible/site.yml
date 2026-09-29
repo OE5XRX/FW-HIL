@@ -257,14 +257,52 @@
         force: false
 
     # ── GitHub Actions self-hosted runner ─────────────────────────────────────
+    # A single marker (.oe5xrx-provisioned, root-owned inside the locked-down
+    # tree) records "this bench has been registered with --disableupdate AND
+    # hardened". Every task that establishes the boundary — the initial
+    # bench-owned directory, config.sh, the root-own hardening, the _work/_diag
+    # hand-back, the marker itself — keys off its absence and so runs exactly
+    # ONCE per bench. Steady-state re-runs then touch nothing in the runner tree
+    # (no ownership flip-flop, no file churn), yet the boundary holds because
+    # nothing relaxes it; a pre-PR bench that predates the hardening is migrated
+    # exactly once. Only the version-stamped extraction re-runs on a version bump.
+    - name: Check whether the runner has been provisioned and hardened
+      ansible.builtin.stat:
+        path: "{{ gh_runner_dir }}/.oe5xrx-provisioned"
+      register: runner_provisioned
+      when: register_runner
+
+    - name: Check whether the runner service unit exists
+      ansible.builtin.stat:
+        path: /etc/systemd/system/gh-actions-runner.service
+      register: runner_unit
+      when: register_runner
+
+    - name: Stop the runner before (re-)provisioning an un-hardened bench
+      # Only on the one migration/first-provision pass (marker absent) and only
+      # if the service already exists. Closes the window Copilot flagged: while
+      # config.sh needs the tree bench-writable, a running runner could let
+      # fork-PR code unlink/replace root-owned files that then get blessed as
+      # root-owned. The "Restart runner service" handler brings it back up.
+      ansible.builtin.systemd:
+        name: gh-actions-runner.service
+        state: stopped
+      when:
+        - register_runner
+        - not runner_provisioned.stat.exists
+        - runner_unit.stat.exists
+
     - name: Create runner directory
+      # Bench-owned ONLY on the first/migration pass so config.sh can write its
+      # state files. On a hardened bench (marker present) this is skipped, so the
+      # top-level dir stays root-owned across re-runs — the boundary never reopens.
       ansible.builtin.file:
         path: "{{ gh_runner_dir }}"
         state: directory
         owner: "{{ bench_user }}"
         group: "{{ bench_user }}"
         mode: "0755"
-      when: register_runner
+      when: register_runner and not runner_provisioned.stat.exists
 
     - name: Download GitHub Actions runner archive
       ansible.builtin.get_url:
@@ -301,26 +339,23 @@
         mode: "0644"
       when: register_runner and runner_extracted is changed
 
-    - name: Check if runner is already configured
-      ansible.builtin.stat:
-        path: "{{ gh_runner_dir }}/.runner"
-      register: runner_configured
-      when: register_runner
-
     - name: Configure GitHub Actions runner
-      # Runs as the bench user so config.sh can write its state files
-      # (.runner/.credentials/.env/.path) into the still-user-owned directory;
-      # the ownership hardening below locks the tree down afterwards.
-      # --disableupdate: the runner binaries end up root-owned (hardening task
-      # below), so a self-update run as the bench user could not replace them
-      # anyway. The version is pinned in `gh_runner_version` and bumped by
-      # re-running this (idempotent) playbook, which re-extracts (see above), so
-      # disabling the in-place auto-update avoids a failing update loop rather
-      # than losing the upgrade path.
+      # Runs on the one un-hardened pass (marker absent), as the bench user so
+      # config.sh can write its state files (.runner/.credentials/.env/.path)
+      # into the still-user-owned directory; the hardening below then locks the
+      # tree down. --replace makes this safe on a pre-PR bench that is already
+      # registered (it re-registers the same name) as well as on a fresh one, so
+      # the one-time migration applies --disableupdate to existing benches too.
+      # --disableupdate: the binaries end up root-owned (hardening below), so a
+      # bench-user self-update could not replace them anyway; the version is
+      # pinned in `gh_runner_version` and bumped by re-running this playbook
+      # (which re-extracts), so this avoids a failing update loop rather than
+      # losing the upgrade path.
       ansible.builtin.command:
         cmd: >-
           ./config.sh
           --unattended
+          --replace
           --url "{{ gh_runner_org_url }}"
           --token "{{ gh_runner_token }}"
           --name "{{ ansible_hostname }}"
@@ -330,9 +365,10 @@
         chdir: "{{ gh_runner_dir }}"
       become: true
       become_user: "{{ bench_user }}"
-      when: register_runner and not runner_configured.stat.exists
-      changed_when: register_runner and not runner_configured.stat.exists
+      when: register_runner and not runner_provisioned.stat.exists
+      changed_when: register_runner and not runner_provisioned.stat.exists
       no_log: true
+      notify: Restart runner service
 
     - name: Root-own the runner application and config (least privilege)
       # The runner executes untrusted fork-PR code AS the bench user. Once
@@ -343,28 +379,47 @@
       # then handed back ONLY the runtime job/diag dirs below. With self-update
       # disabled the runner reads (never writes) the top-level at runtime, so it
       # runs fine root-owned. Follows GitHub's self-hosted-runner hardening guide.
+      # Once-only (marker-absent): re-running would needlessly re-chown the whole
+      # tree every pass; instead the boundary is set here and simply not relaxed
+      # afterwards (see the section note above).
       ansible.builtin.file:
         path: "{{ gh_runner_dir }}"
         owner: root
         group: root
         recurse: true
-      when: register_runner
+      when: register_runner and not runner_provisioned.stat.exists
 
     - name: Hand the runner job/diag directories back to the bench user
       # `_work` (job workspace / checkouts) and `_diag` (runner logs) are the only
       # paths the runner writes at job time; they must be bench-user-writable.
-      # Everything else stays root-owned by the task above.
+      # Everything else stays root-owned by the task above. No `mode:` here — with
+      # recurse it would rewrite every descendant file's bits (making checkouts
+      # and logs executable/world-readable and dirtying job worktrees); ownership
+      # is restored recursively without touching the existing modes. Once-only
+      # (marker-absent), same as the root-own task, so ordinary job/log files are
+      # not re-chowned on every subsequent playbook run.
       ansible.builtin.file:
         path: "{{ gh_runner_dir }}/{{ item }}"
         state: directory
         owner: "{{ bench_user }}"
         group: "{{ bench_user }}"
         recurse: true
-        mode: "0755"
       loop:
         - _work
         - _diag
-      when: register_runner
+      when: register_runner and not runner_provisioned.stat.exists
+
+    - name: Mark the runner as provisioned and hardened
+      # Written last, root-owned inside the now-locked tree, so the once-only
+      # tasks above (bench-owned dir, config.sh, runner stop) never run again on
+      # this bench — the ownership boundary is not reopened by future re-runs.
+      ansible.builtin.file:
+        path: "{{ gh_runner_dir }}/.oe5xrx-provisioned"
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+      when: register_runner and not runner_provisioned.stat.exists
 
     - name: Deploy runner systemd service unit
       ansible.builtin.template:
